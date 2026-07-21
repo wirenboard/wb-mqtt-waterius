@@ -1,0 +1,12 @@
+# Build metadata lives in setup.py (canonical for WB python packages, namespace
+# wb.*). This file only carries tooling configuration.
+
+[tool.black]
+line-length = 110
+
+[tool.isort]
+profile = "black"
+known_first_party = ["wb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

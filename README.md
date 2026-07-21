@@ -1,10 +1,35 @@
 # wb-mqtt-waterius
 
-Send Wiren Board meter readings to the [Waterius](https://waterius.ru) cloud.
+Отправка показаний счётчиков, подключённых к Wiren Board, в личный кабинет
+[waterius.ru](https://waterius.ru) через универсальный HTTP API.
 
-`wb-mqtt-waterius` reads impulse meter values published to MQTT by Wiren Board and
-sends them on the scheduled days and time to the waterius.ru personal cabinet through
-the universal HTTP API. Configuration is done in the web UI (Settings → Configuration
-files) via a json-editor schema.
+Сервис в выбранные дни в заданное время читает значения из MQTT-топиков контроллера и
+отправляет их в облако Waterius. Один ключ = одно устройство Waterius = до 4 каналов.
 
-The implementation lands through a series of reviewable pull requests.
+> **Полная инструкция пользователя — на вики Wiren Board** (страница `wb-mqtt-waterius`).
+> Ниже — краткая справка.
+
+## Настройка
+
+Настраивается в веб-интерфейсе: **Настройки → Конфигурационные файлы → Подача показаний
+счетчиков в Ватериус**. Нужен ключ устройства из кабинета Waterius:
+
+1. Войти на https://account.waterius.ru
+2. «Добавить устройство» → раздел «Умный дом» → **WirenBoard** → «Создать устройство»
+3. Скопировать ключ со страницы в конфигуратор, добавить каналы (топик + тип счётчика).
+
+**Значение из топика отправляется как есть, без пересчёта** — топик уже должен содержать
+показание в единицах Waterius (вода и газ в м³, электричество в кВт·ч, тепло в Гкал).
+Пересчёт из импульсов делается на стороне Wiren Board (scale канала или wb-rules).
+
+В веб-интерфейсе появляются пульт **«Интеграция с Ватериус»** (статус, переключатель
+автоотправки, время следующей отправки) и по устройству на каждый ключ с каналами-зеркалами.
+
+## CLI
+
+```sh
+wb-mqtt-waterius daemon           # запуск сервиса (systemd делает это сам)
+wb-mqtt-waterius send             # разовая отправка сейчас и выход
+wb-mqtt-waterius send --dry-run   # собрать и вывести payload без отправки
+wb-mqtt-waterius --version
+```

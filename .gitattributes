@@ -1,0 +1,18 @@
+# Force LF line endings for files that run on the Linux controller.
+# Development often happens on Windows, without this, CRLF sneaks in and the
+# shell/systemd/python files break or produce spurious diffs.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.conf  text eol=lf
+*.js    text eol=lf
+*.md    text eol=lf
+Jenkinsfile      text eol=lf
+debian/rules     text eol=lf
+debian/*.service text eol=lf
+debian/*.install text eol=lf
+debian/*.prerm   text eol=lf
+debian/*.postrm  text eol=lf
+bin/*            text eol=lf

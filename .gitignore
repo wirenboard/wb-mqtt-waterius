@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+.pybuild/
+debian/wb-mqtt-waterius/
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
