@@ -4,7 +4,3 @@ export PYBUILD_NAME=wb-mqtt-waterius
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
-
-# gzip-compress the .deb so it installs on older WB controllers whose dpkg predates zstd
-override_dh_builddeb:
-	dh_builddeb -- -Zgzip

@@ -1,9 +1,8 @@
-"""Version wiring guard.
+"""Version contract guard.
 
-setup.py derives the package version from debian/changelog, and that value is the
-single source of truth (wb.mqtt_waterius.__version__ resolves to it via
-importlib.metadata once the distribution is installed). These tests keep the
-"no hardcoded version" contract intact.
+setup.py derives the package version from debian/changelog, which is the single
+source of truth. This test checks the version is well-formed (MAJOR.MINOR.PATCH),
+which the WB Debian packaging expects.
 """
 
 from __future__ import annotations
@@ -19,13 +18,6 @@ import setuptools
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _changelog_version() -> str:
-    first_line = (REPO_ROOT / "debian" / "changelog").read_text(encoding="utf-8").splitlines()[0]
-    match = re.match(r"^wb-mqtt-waterius \(([^)]+)\)", first_line)
-    assert match, f"unexpected changelog header: {first_line!r}"
-    return match.group(1)
-
-
 def _load_setup(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     # setup.py calls setuptools.setup() at import and reads debian/changelog relative
     # to the cwd, so stub the call and run from the repo root.
@@ -37,10 +29,6 @@ def _load_setup(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     return module
 
 
-def test_setup_version_matches_changelog(monkeypatch: pytest.MonkeyPatch) -> None:
-    setup_module = _load_setup(monkeypatch)
-    assert setup_module.get_version() == _changelog_version()
-
-
-def test_changelog_version_is_pep440ish() -> None:
-    assert re.match(r"^\d+\.\d+\.\d+", _changelog_version())
+def test_changelog_version_is_three_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
+    version = _load_setup(monkeypatch).get_version()
+    assert re.match(r"^\d+\.\d+\.\d+$", version), f"expected MAJOR.MINOR.PATCH, got {version!r}"

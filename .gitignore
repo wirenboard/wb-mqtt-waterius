@@ -1,3 +1,6 @@
+pyproject.toml
+.coveragerc
+
 __pycache__/
 *.pyc
 *.egg-info/

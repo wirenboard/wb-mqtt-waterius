@@ -1,4 +1,6 @@
-from setuptools import find_namespace_packages, setup
+#!/usr/bin/env python3
+
+from setuptools import setup
 
 
 def get_version():
@@ -13,7 +15,10 @@ setup(
     maintainer_email="info@wirenboard.com",
     description="Send Wiren Board meter readings to the Waterius cloud",
     url="https://github.com/wirenboard/wb-mqtt-waterius",
-    packages=find_namespace_packages(include=["wb.*"]),
-    scripts=["bin/wb-mqtt-waterius"],
     license="MIT",
+    packages=[
+        # "wb"                     # Explicitly excluded: provided by base package
+        "wb.mqtt_waterius",
+    ],
+    scripts=["bin/wb-mqtt-waterius"],
 )
