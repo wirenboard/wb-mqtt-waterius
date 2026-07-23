@@ -15,15 +15,23 @@ from pathlib import Path
 import pytest
 import setuptools
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+
+def _repo_root() -> Path:
+    # Walk up to the dir with setup.py and debian/changelog. Under pybuild the test
+    # runs below the unpacked source root, so parent.parent won't reach it.
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "setup.py").is_file() and (parent / "debian" / "changelog").is_file():
+            return parent
+    raise RuntimeError("repo root with setup.py and debian/changelog not found")
 
 
 def _load_setup(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     # setup.py calls setuptools.setup() at import and reads debian/changelog relative
     # to the cwd, so stub the call and run from the repo root.
-    monkeypatch.chdir(REPO_ROOT)
+    root = _repo_root()
+    monkeypatch.chdir(root)
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
-    spec = importlib.util.spec_from_file_location("_waterius_setup", REPO_ROOT / "setup.py")
+    spec = importlib.util.spec_from_file_location("_waterius_setup", root / "setup.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
