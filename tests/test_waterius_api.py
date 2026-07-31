@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 import requests
@@ -21,7 +21,7 @@ class _FakeSession:
         self._exc = exc
         self.calls = []
 
-    def post(self, url: str, **kwargs) -> Optional[_FakeResponse]:
+    def post(self, url: str, **kwargs: Any) -> Optional[_FakeResponse]:
         self.calls.append((url, kwargs))
         if self._exc:
             raise self._exc
@@ -29,19 +29,23 @@ class _FakeSession:
 
 
 class _SeqSession:
-    """Returns a queued sequence of responses, one per post() call."""
+    """
+    Returns a queued sequence of responses, one per post() call.
+    """
 
     def __init__(self, responses: list) -> None:
         self._responses = list(responses)
         self.calls = []
 
-    def post(self, url: str, **kwargs) -> _FakeResponse:
+    def post(self, url: str, **kwargs: Any) -> _FakeResponse:
         self.calls.append((url, kwargs))
         return self._responses.pop(0)
 
 
-def _client(session, **knobs) -> waterius_api.WateriusClient:
-    """Client on a fake session. Kwargs override the transport defaults."""
+def _client(session: Any, **knobs: Any) -> waterius_api.WateriusClient:
+    """
+    Client on a fake session. Kwargs override the transport defaults.
+    """
     return waterius_api.WateriusClient(session=session, **knobs)
 
 
