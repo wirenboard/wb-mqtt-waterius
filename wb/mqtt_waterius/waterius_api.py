@@ -5,8 +5,6 @@ Protocol: POST JSON {"ch0": <value>, "data_type0": <type>,
 ..., "key": <token>}. One key = one device = up to 4 channels (ch0..ch3).
 """
 
-from __future__ import annotations
-
 import logging
 import threading
 from dataclasses import dataclass
