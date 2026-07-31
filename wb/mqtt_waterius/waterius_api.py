@@ -1,4 +1,5 @@
-"""Waterius universal API — build payloads and send readings.
+"""
+Waterius universal API — build payloads and send readings.
 
 Protocol: POST JSON {"ch0": <value>, "data_type0": <type>,
 ..., "key": <token>}. One key = one device = up to 4 channels (ch0..ch3).
@@ -35,7 +36,7 @@ log = logging.getLogger(__name__)
 
 def mask_key(key: Optional[str]) -> str:
     """
-    Mask a Waterius key for logs and device titles
+    Mask a Waterius key for logs and device titles.
 
     A key is a cloud write credential, so it is never shown in full. Real keys are long
     tokens and mask to their first 5 characters. A very short key reveals at most half of
@@ -67,7 +68,7 @@ def mask_key(key: Optional[str]) -> str:
 @dataclass(frozen=True)
 class ChannelReading:
     """
-    One meter reading, as the payload builder expects it
+    One meter reading, as the payload builder expects it.
 
     Attributes:
         topic: source MQTT topic, names the channel in error messages
@@ -84,7 +85,14 @@ class ChannelReading:
 
 @dataclass(repr=False)
 class SendResult:
-    """Outcome of a single POST to Waterius."""
+    """
+    Outcome of a single POST to Waterius.
+
+    Attributes:
+        ok: whether Waterius accepted the request
+        status_code: HTTP status of the last attempt, None when no response arrived
+        error: failure reason, None when the request succeeded or the status speaks for itself
+    """
 
     ok: bool
     status_code: Optional[int] = None
@@ -98,7 +106,7 @@ class SendResult:
 
 def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[str, object]:
     """
-    Build the JSON body for one Waterius device
+    Build the JSON body for one Waterius device.
 
     Waterius maps readings by channel number, so a device with a gap would write its
     readings into the wrong slots of the cabinet. Every channel must therefore carry a
@@ -140,7 +148,7 @@ def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[s
 
 class WateriusClient:
     """
-    Client of the Waterius universal API
+    Client of the Waterius universal API.
 
     Args:
         endpoint: Waterius universal API URL
@@ -166,12 +174,14 @@ class WateriusClient:
         self._session = session or requests.Session()
 
     def close(self) -> None:
-        """Release the pooled connections. The client is unusable afterwards."""
+        """
+        Release the pooled connections. The client is unusable afterwards.
+        """
         self._session.close()
 
     def send(self, payload: dict[str, object], stop: Optional[threading.Event] = None) -> SendResult:
         """
-        POST one device's readings to Waterius
+        POST one device's readings to Waterius.
 
         Never raises on a transport failure. Transient ones (nginx 503, 429/502/504, network
         errors) are retried with a linear backoff. A non-retryable HTTP error returns at once,
