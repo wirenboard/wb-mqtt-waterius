@@ -8,6 +8,7 @@ Protocol: POST JSON {"ch0": <value>, "data_type0": <type>,
 import logging
 import threading
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Optional
 
 import requests
@@ -16,51 +17,40 @@ DEFAULT_ENDPOINT = "https://uc.waterius.ru"
 
 # Transport defaults of the client below.
 DEFAULT_TIMEOUT = 15  # seconds, per request
-DEFAULT_RETRIES = 3  # attempts in total, including the first one
+DEFAULT_MAX_ATTEMPTS = 3  # requests per send, retries included
 DEFAULT_BACKOFF = 2.0  # seconds before the next attempt, multiplied by the attempt number
 
-# Transient statuses worth retrying. The endpoint sits behind nginx that returns 503
+# Transient status codes worth retrying. The endpoint sits behind nginx that returns 503
 # under a burst (empirically confirmed rate limiting, not a real error). 429/502/504
 # are the usual transient companions.
-RETRYABLE_STATUS = {429, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
 # Waterius returns 404 when the key resolves to no registered device (an invalid or
 # revoked key). A hard error, not transient — surface it clearly and do not retry.
-KEY_NOT_FOUND_STATUS = 404
+KEY_NOT_FOUND_CODE = 404
 KEY_NOT_FOUND_ERROR = "Key not accepted by Waterius"
 
 log = logging.getLogger(__name__)
 
 
-def mask_key(key: Optional[str]) -> str:
+def mask_key(key: str) -> str:
     """
     Mask a Waterius key for logs and device titles.
 
-    A key is a cloud write credential, so it is never shown in full. Real keys are long
-    tokens and mask to their first 5 characters. A very short key reveals at most half of
-    itself.
+    A key is a cloud write credential, so it is never shown in full. Keys are 32-character
+    tokens and mask to their first 5 characters.
 
     Args:
-        key: Waterius device key, may be None or empty
+        key: Waterius device key, non-empty — the config rejects a device without one
 
     Returns:
-        Masked prefix of the key, empty string when there is no key
+        First characters of the key
 
     Examples:
         >>> mask_key("0123456789abcdef0123456789abcdef")
         '01234'
-        >>> mask_key("abcd")
-        'ab'
-        >>> mask_key("ab")
-        'a'
-        >>> mask_key("")
-        ''
-        >>> mask_key(None)
-        ''
     """
-    if not key:
-        return ""
-    return key[: min(5, len(key) // 2)]
+    return key[:5]
 
 
 @dataclass(frozen=True)
@@ -70,13 +60,13 @@ class ChannelReading:
 
     Attributes:
         topic: source MQTT topic, names the channel in error messages
-        type: Waterius data-type code, becomes data_type<N> in the body
+        data_type: Waterius data-type code, becomes data_type<N> in the body
         value: the reading itself, None when the value has not arrived yet
         serial: meter serial number, becomes serial<N> when set
     """
 
     topic: str
-    type: int
+    data_type: int
     value: Optional[float]
     serial: Optional[str] = None
 
@@ -138,7 +128,7 @@ def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[s
         if channel.value is None:
             raise ValueError(f"device {mask_key(key)}: channel {channel.topic} has no value")
         payload[f"ch{index}"] = channel.value
-        payload[f"data_type{index}"] = channel.type
+        payload[f"data_type{index}"] = channel.data_type
         if channel.serial:
             payload[f"serial{index}"] = str(channel.serial)
     return payload
@@ -148,28 +138,42 @@ class WateriusClient:
     """
     Client of the Waterius universal API.
 
+    Owns one requests session, so devices sent one after another reuse the connection
+    instead of a TLS handshake per key. Use as a context manager, one client per send
+    cycle: the session it owns lives and dies with it.
+
     Args:
         endpoint: Waterius universal API URL
         timeout: per-request timeout in seconds
-        retries: attempts in total, including the first one
+        max_attempts: how many requests to make before giving up
         backoff: seconds before the next attempt, multiplied by the attempt number
-        session: requests session to reuse, a fresh one is created when omitted
     """
 
     # Transport knobs with sane defaults, overridden only by tests.
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(
         self,
         endpoint: str = DEFAULT_ENDPOINT,
         timeout: int = DEFAULT_TIMEOUT,
-        retries: int = DEFAULT_RETRIES,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff: float = DEFAULT_BACKOFF,
-        session: Optional[requests.Session] = None,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
-        self.retries = retries
+        self.max_attempts = max_attempts
         self.backoff = backoff
-        self._session = session or requests.Session()
+        # A session opens no socket: the connection is made on the first request.
+        self._session = requests.Session()
+
+    def __enter__(self) -> "WateriusClient":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
 
     def close(self) -> None:
         """
@@ -177,7 +181,7 @@ class WateriusClient:
         """
         self._session.close()
 
-    def send(self, payload: dict[str, object], stop: Optional[threading.Event] = None) -> SendResult:
+    def send(self, payload: dict[str, object], stop_event: Optional[threading.Event] = None) -> SendResult:
         """
         POST one device's readings to Waterius.
 
@@ -187,19 +191,19 @@ class WateriusClient:
 
         Args:
             payload: request body from build_payload
-            stop: caller's shutdown event. The backoff waits on it instead of sleeping, so a
-                shutdown aborts the remaining attempts at once
+            stop_event: caller's shutdown event. The backoff waits on it instead of sleeping,
+                so a shutdown aborts the remaining attempts at once
 
         Returns:
             Outcome of the last attempt, with the status code and the failure reason when known
         """
         # Callers without a shutdown flag get a never-set event: waiting on it is a plain sleep.
-        stop = stop or threading.Event()
-        retries = self.retries
-        # Holds the most recent failure, so the caller gets the real reason once the retries run
-        # out. Only the initial value survives if retries is 0.
+        stop_event = stop_event or threading.Event()
+        max_attempts = self.max_attempts
+        # Holds the most recent failure, so the caller gets the real reason once the attempts run
+        # out. Only the initial value survives if max_attempts is 0.
         last_failure = SendResult(ok=False, error="no attempt made")
-        for attempt in range(1, retries + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = self._session.post(
                     self.endpoint,
@@ -208,21 +212,21 @@ class WateriusClient:
                     timeout=self.timeout,
                 )
             except requests.RequestException as exc:
-                log.warning("Send failed (attempt %d/%d): %s", attempt, retries, exc)
+                log.warning("Send failed (attempt %d/%d): %s", attempt, max_attempts, exc)
                 last_failure = SendResult(ok=False, error=str(exc))
             else:
                 if 200 <= response.status_code < 300:
                     return SendResult(ok=True, status_code=response.status_code)
-                if response.status_code not in RETRYABLE_STATUS:
-                    error = KEY_NOT_FOUND_ERROR if response.status_code == KEY_NOT_FOUND_STATUS else None
+                if response.status_code not in RETRYABLE_STATUS_CODES:
+                    error = KEY_NOT_FOUND_ERROR if response.status_code == KEY_NOT_FOUND_CODE else None
                     log.error("Waterius returned HTTP %s: %s", response.status_code, response.text[:200])
                     return SendResult(ok=False, status_code=response.status_code, error=error)
                 last_failure = SendResult(ok=False, status_code=response.status_code)
                 log.warning(
-                    "Waterius HTTP %s (attempt %d/%d), retrying", response.status_code, attempt, retries
+                    "Waterius HTTP %s (attempt %d/%d), retrying", response.status_code, attempt, max_attempts
                 )
-            if attempt == retries:
+            if attempt == max_attempts:
                 break  # that was the last attempt, nothing left to wait for
-            if stop.wait(self.backoff * attempt):
+            if stop_event.wait(self.backoff * attempt):
                 break  # the event fired during the backoff: a shutdown was requested
         return last_failure

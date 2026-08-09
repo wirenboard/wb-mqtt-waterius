@@ -18,6 +18,7 @@ class _FakeSession:
         self._response = response
         self._exc = exc
         self.calls = []
+        self.closed = False
 
     def post(self, url: str, **kwargs: Any) -> Optional[_FakeResponse]:
         self.calls.append((url, kwargs))
@@ -25,10 +26,16 @@ class _FakeSession:
             raise self._exc
         return self._response
 
+    def close(self) -> None:
+        self.closed = True
+
 
 class _SeqSession:
     """
     Returns a queued sequence of responses, one per post() call.
+
+    The last response repeats once the queue runs dry, so a test queues the responses its
+    scenario needs without sizing the queue to the number of attempts the client makes.
     """
 
     def __init__(self, responses: list) -> None:
@@ -37,14 +44,21 @@ class _SeqSession:
 
     def post(self, url: str, **kwargs: Any) -> _FakeResponse:
         self.calls.append((url, kwargs))
-        return self._responses.pop(0)
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
 
 
 def _client(session: Any, **knobs: Any) -> waterius_api.WateriusClient:
     """
     Client on a fake session. Kwargs override the transport defaults.
+
+    The client owns its session and takes no injection, so the fake replaces the private
+    field on purpose.
     """
-    return waterius_api.WateriusClient(session=session, **knobs)
+    client = waterius_api.WateriusClient(**knobs)
+    client._session = session  # pylint: disable=protected-access
+    return client
 
 
 def test_build_payload_rejects_channel_without_value() -> None:
@@ -80,7 +94,7 @@ def test_send_network_error() -> None:
     result = _client(session, backoff=0).send({"key": "K"})
     assert not result.ok
     assert "no route" in result.error
-    assert len(session.calls) == waterius_api.DEFAULT_RETRIES  # retried
+    assert len(session.calls) == waterius_api.DEFAULT_MAX_ATTEMPTS  # retried
 
 
 def test_send_retries_503_then_succeeds() -> None:
@@ -92,8 +106,8 @@ def test_send_retries_503_then_succeeds() -> None:
 
 
 def test_send_503_exhausted_reports_failure() -> None:
-    session = _SeqSession([_FakeResponse(503, "busy")] * 3)
-    result = _client(session, retries=3, backoff=0).send({"key": "K"})
+    session = _SeqSession([_FakeResponse(503, "busy")])
+    result = _client(session, max_attempts=3, backoff=0).send({"key": "K"})
     assert not result.ok
     assert result.status_code == 503
     assert len(session.calls) == 3
@@ -102,10 +116,10 @@ def test_send_503_exhausted_reports_failure() -> None:
 def test_send_stop_aborts_retries() -> None:
     # An already-set stop event (the daemon shutting down) aborts the remaining retries
     # instead of waiting through the backoff, so shutdown stays responsive.
-    session = _SeqSession([_FakeResponse(503, "busy")] * 3)
-    stop = threading.Event()
-    stop.set()
-    result = _client(session, retries=3).send({"key": "K"}, stop=stop)
+    session = _SeqSession([_FakeResponse(503, "busy")])
+    stop_event = threading.Event()
+    stop_event.set()
+    result = _client(session, max_attempts=3).send({"key": "K"}, stop_event=stop_event)
     assert not result.ok
     assert result.status_code == 503
     assert len(session.calls) == 1  # stopped after the first attempt's backoff
@@ -128,3 +142,20 @@ def test_send_404_reports_key_not_found() -> None:
     assert result.status_code == 404
     assert result.error == waterius_api.KEY_NOT_FOUND_ERROR
     assert len(session.calls) == 1  # non-retryable, stops immediately
+
+
+def test_client_releases_its_session_on_exit() -> None:
+    # The context manager is the intended entry point: the session goes out with the cycle.
+    session = _FakeSession(response=_FakeResponse(200))
+    with _client(session) as client:
+        assert client.send({"key": "K"}).ok
+    assert session.closed
+
+
+def test_client_releases_its_session_on_exception() -> None:
+    # A cycle that blows up must not leak the pool — that is what the context manager is for.
+    session = _FakeSession(response=_FakeResponse(200))
+    with pytest.raises(RuntimeError):
+        with _client(session):
+            raise RuntimeError("cycle blew up")
+    assert session.closed
