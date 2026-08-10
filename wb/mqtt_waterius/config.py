@@ -99,10 +99,10 @@ class Config:
     The whole configuration: send time, weekdays, and the list of devices.
     """
 
-    def __init__(self, send_time: str, devices: list[Device], days: Iterable[int]) -> None:
+    def __init__(self, send_time: str, devices: list[Device], days_of_week: Iterable[int]) -> None:
         self.send_time: str = send_time
         self.devices: list[Device] = devices
-        self.days: set[int] = set(days)
+        self.days_of_week: set[int] = set(days_of_week)
 
     @property
     def send_hour_minute(self) -> tuple[int, int]:
@@ -118,20 +118,20 @@ class Config:
 
 
 def _parse_channel(raw_channel: dict) -> Channel:
-    topic = raw_channel.get("topic")
+    topic = raw_channel.get("mqttTopicName")
     if not topic or "/" not in topic:
-        raise ConfigError(f"channel topic must be 'device/control', got {topic!r}")
-    if "data_type" not in raw_channel:
-        raise ConfigError(f"channel {topic!r} has no data_type")
+        raise ConfigError(f"channel mqttTopicName must be 'device/control', got {topic!r}")
+    if "dataType" not in raw_channel:
+        raise ConfigError(f"channel {topic!r} has no dataType")
     try:
-        data_type = int(raw_channel["data_type"])
+        data_type = int(raw_channel["dataType"])
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"channel {topic!r} has a non-numeric data_type {raw_channel['data_type']!r}"
+            f"channel {topic!r} has a non-numeric dataType {raw_channel['dataType']!r}"
         ) from exc
     if data_type not in DATA_TYPES:
         raise ConfigError(
-            f"channel {topic!r} has unknown data_type {data_type}, "
+            f"channel {topic!r} has unknown dataType {data_type}, "
             f"expected {min(DATA_TYPES)}..{max(DATA_TYPES)}"
         )
     return Channel(topic, data_type, raw_channel.get("serial"))
@@ -176,34 +176,36 @@ def _parse_send_time(data: dict) -> str:
     Pull the daily send time out of the raw config.
 
     Examples:
-        >>> _parse_send_time({"send_time": "03:00"})
+        >>> _parse_send_time({"sendTime": "03:00"})
         '03:00'
     """
-    send_time = data.get("send_time")
+    send_time = data.get("sendTime")
     if not isinstance(send_time, str):
-        raise ConfigError("send_time is required")
+        raise ConfigError("sendTime is required")
     if not TIME_RE.match(send_time):
-        raise ConfigError(f"send_time must be HH:MM, got {send_time!r}")
+        raise ConfigError(f"sendTime must be HH:MM, got {send_time!r}")
     return send_time
 
 
-def _parse_days(data: dict) -> set[int]:
+def _parse_days_of_week(data: dict) -> set[int]:
     """
     Convert the configured weekday names to datetime.weekday() indices.
 
-    Days are required and at least one name must be known. An unknown name is dropped, but a
-    list of nothing but unknown names is an error rather than a silent "every day".
+    Days are required and every name must be known. Dropping an unrecognized name would turn
+    a typo in a hand-edited file into a day that silently never fires.
 
     Examples:
-        >>> sorted(_parse_days({"days": ["monday", "sunday"]}))
+        >>> sorted(_parse_days_of_week({"daysOfWeek": ["monday", "sunday"]}))
         [0, 6]
     """
-    raw_days = data.get("days")
+    raw_days = data.get("daysOfWeek")
     if not isinstance(raw_days, list) or not raw_days:
         raise ConfigError("at least one send day must be selected")
-    days = {WEEKDAYS.index(day) for day in raw_days if day in WEEKDAYS}
-    if not days:
-        raise ConfigError("send days contain no valid weekday")
+    days: set[int] = set()
+    for day in raw_days:
+        if day not in WEEKDAYS:
+            raise ConfigError(f"unknown send day {day!r}")
+        days.add(WEEKDAYS.index(day))
     return days
 
 
@@ -214,18 +216,18 @@ def parse_config(data: dict) -> Config:
     Examples:
         >>> config = parse_config(
         ...     {
-        ...         "send_time": "03:00",
-        ...         "days": ["monday", "friday"],
+        ...         "sendTime": "03:00",
+        ...         "daysOfWeek": ["monday", "friday"],
         ...         "devices": [
         ...             {
         ...                 "key": "KEY",
         ...                 "name": "Boiler",
-        ...                 "channels": [{"topic": "wb-map12/ch1", "data_type": 0}],
+        ...                 "channels": [{"mqttTopicName": "wb-map12/ch1", "dataType": 0}],
         ...             }
         ...         ],
         ...     }
         ... )
-        >>> config.send_hour_minute, sorted(config.days)
+        >>> config.send_hour_minute, sorted(config.days_of_week)
         ((3, 0), [0, 4])
         >>> config.devices[0].name, config.devices[0].channels[0].mqtt_topic
         ('Boiler', '/devices/wb-map12/controls/ch1')
@@ -239,7 +241,7 @@ def parse_config(data: dict) -> Config:
     duplicate = _find_duplicate_key(devices)
     if duplicate:
         raise ConfigError(f"duplicate device key {mask_key(duplicate)!r}")
-    return Config(send_time=send_time, devices=devices, days=_parse_days(data))
+    return Config(send_time=send_time, devices=devices, days_of_week=_parse_days_of_week(data))
 
 
 def load_config(path: Optional[str] = None) -> Config:

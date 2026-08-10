@@ -7,107 +7,9 @@
     "path": "/etc/wb-mqtt-waterius.conf",
     "service": "wb-mqtt-waterius"
   },
-  "definitions": {
-    "channel": {
-      "type": "object",
-      "title": "wateriusChannelTitle",
-      "headerTemplate": "{{self.topic}}",
-      "properties": {
-        "topic": {
-          "type": "string",
-          "propertyOrder": 1,
-          "title": "wateriusChannelTopicTitle",
-          "pattern": "^[^/+#]+/[^/+#]+$",
-          "minLength": 3,
-          "_format": "wb-autocomplete",
-          "options": {
-            "patternmessage": "wateriusChannelTopicPatternMessage",
-            "wb": {
-              "data": "devices"
-            }
-          }
-        },
-        "data_type": {
-          "type": "integer",
-          "propertyOrder": 2,
-          "title": "wateriusDataTypeTitle",
-          "enum": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-          "default": 0,
-          "options": {
-            "enum_titles": [
-              "wateriusDataTypeColdWater",
-              "wateriusDataTypeHotWater",
-              "wateriusDataTypeElectricitySingle",
-              "wateriusDataTypeGas",
-              "wateriusDataTypeHeat",
-              "wateriusDataTypeElectricityDay",
-              "wateriusDataTypeElectricityNight",
-              "wateriusDataTypeElectricityPeak",
-              "wateriusDataTypeElectricitySemiPeak",
-              "wateriusDataTypeDrinkingWater"
-            ]
-          }
-        },
-        "serial": {
-          "type": "string",
-          "propertyOrder": 3,
-          "title": "wateriusChannelSerialTitle",
-          "description": "wateriusChannelSerialDescription"
-        }
-      },
-      "required": ["topic", "data_type"]
-    },
-    "device": {
-      "type": "object",
-      "title": "wateriusDeviceTitle",
-      "headerTemplate": "{{self.name}}",
-      "options": {
-        "disable_edit_json": true,
-        "disable_properties": true
-      },
-      "properties": {
-        "name": {
-          "type": "string",
-          "propertyOrder": 2,
-          "title": "wateriusDeviceNameTitle",
-          "description": "wateriusDeviceNameDescription",
-          "maxLength": 30,
-          "default": ""
-        },
-        "key": {
-          "type": "string",
-          "propertyOrder": 1,
-          "title": "wateriusDeviceKeyTitle",
-          "description": "wateriusDeviceKeyDescription",
-          "minLength": 1
-        },
-        "channels": {
-          "type": "array",
-          "propertyOrder": 3,
-          "title": "wateriusMetersTitle",
-          "description": "wateriusMetersDescription",
-          "minItems": 1,
-          "maxItems": 4,
-          "_format": "table",
-          "options": {
-            "disable_collapse": true,
-            "array_controls_top": true,
-            "disable_array_reorder": true,
-            "wb": {
-              "disable_panel": true
-            }
-          },
-          "items": {
-            "$ref": "#/definitions/channel"
-          }
-        }
-      },
-      "required": ["name", "key", "channels"]
-    }
-  },
   "_format": "grid-strict",
   "properties": {
-    "send_time": {
+    "sendTime": {
       "type": "string",
       "propertyOrder": 1,
       "title": "wateriusSendTimeTitle",
@@ -121,7 +23,7 @@
         "grid_break": true
       }
     },
-    "days": {
+    "daysOfWeek": {
       "type": "array",
       "propertyOrder": 2,
       "title": "wateriusSendDaysTitle",
@@ -156,18 +58,108 @@
       "title": "wateriusDevicesTitle",
       "description": "wateriusDevicesDescription",
       "minItems": 0,
-      "items": {
-        "$ref": "#/definitions/device"
-      },
       "options": {
         "array_controls_top": true,
         "disable_array_delete_last_row": true,
         "disable_array_reorder": true,
         "grid_columns": 12
+      },
+      "items": {
+        "type": "object",
+        "title": "wateriusDeviceTitle",
+        "headerTemplate": "{{self.name}}",
+        "options": {
+          "disable_edit_json": true,
+          "disable_properties": true
+        },
+        "properties": {
+          "key": {
+            "type": "string",
+            "propertyOrder": 1,
+            "title": "wateriusDeviceKeyTitle",
+            "description": "wateriusDeviceKeyDescription",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "propertyOrder": 2,
+            "title": "wateriusDeviceNameTitle",
+            "description": "wateriusDeviceNameDescription",
+            "maxLength": 30,
+            "default": ""
+          },
+          "channels": {
+            "type": "array",
+            "propertyOrder": 3,
+            "title": "wateriusMetersTitle",
+            "description": "wateriusMetersDescription",
+            "minItems": 1,
+            "maxItems": 4,
+            "_format": "table",
+            "options": {
+              "disable_collapse": true,
+              "array_controls_top": true,
+              "disable_array_reorder": true,
+              "wb": {
+                "disable_panel": true
+              }
+            },
+            "items": {
+              "type": "object",
+              "title": "wateriusChannelTitle",
+              "headerTemplate": "{{self.mqttTopicName}}",
+              "properties": {
+                "mqttTopicName": {
+                  "type": "string",
+                  "propertyOrder": 1,
+                  "title": "wateriusChannelTopicTitle",
+                  "pattern": "^[^/+#]+/[^/+#]+$",
+                  "minLength": 3,
+                  "_format": "wb-autocomplete",
+                  "options": {
+                    "patternmessage": "wateriusChannelTopicPatternMessage",
+                    "wb": {
+                      "data": "devices"
+                    }
+                  }
+                },
+                "dataType": {
+                  "type": "integer",
+                  "propertyOrder": 2,
+                  "title": "wateriusDataTypeTitle",
+                  "enum": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                  "default": 0,
+                  "options": {
+                    "enum_titles": [
+                      "wateriusDataTypeColdWater",
+                      "wateriusDataTypeHotWater",
+                      "wateriusDataTypeElectricitySingle",
+                      "wateriusDataTypeGas",
+                      "wateriusDataTypeHeat",
+                      "wateriusDataTypeElectricityDay",
+                      "wateriusDataTypeElectricityNight",
+                      "wateriusDataTypeElectricityPeak",
+                      "wateriusDataTypeElectricitySemiPeak",
+                      "wateriusDataTypeDrinkingWater"
+                    ]
+                  }
+                },
+                "serial": {
+                  "type": "string",
+                  "propertyOrder": 3,
+                  "title": "wateriusChannelSerialTitle",
+                  "description": "wateriusChannelSerialDescription"
+                }
+              },
+              "required": ["mqttTopicName", "dataType"]
+            }
+          }
+        },
+        "required": ["key", "name", "channels"]
       }
     }
   },
-  "required": ["send_time", "days", "devices"],
+  "required": ["sendTime", "daysOfWeek", "devices"],
   "options": {
     "disable_collapse": true
   },
@@ -193,7 +185,7 @@
       "wateriusChannelSerialDescription": "Optional meter serial number. Edit it in the Waterius personal cabinet.",
       "wateriusDeviceTitle": "Device",
       "wateriusDeviceNameTitle": "Device Name",
-      "wateriusDeviceNameDescription": "Device name in the Waterius personal cabinet. Updated there on every reading upload.",
+      "wateriusDeviceNameDescription": "Device name in the Waterius personal cabinet. Updated there on every reading upload. Leave empty to keep the name set in the cabinet.",
       "wateriusDeviceKeyTitle": "API Key",
       "wateriusDeviceKeyDescription": "Unique device key. Log in to account.waterius.ru, add a device (Smart home -> WirenBoard), copy the key.",
       "wateriusMetersTitle": "Meters",
@@ -230,11 +222,11 @@
       "wateriusDataTypeElectricityPeak": "Электричество (Пик)",
       "wateriusDataTypeElectricitySemiPeak": "Электричество (Полупик)",
       "wateriusDataTypeDrinkingWater": "Питьевая вода",
-      "wateriusChannelSerialTitle": "Серийный номер из УК",
-      "wateriusChannelSerialDescription": "Необязательный серийный номер счетчика в системе УК. Редактируется в личном кабинете Ватериус.",
+      "wateriusChannelSerialTitle": "Серийный номер",
+      "wateriusChannelSerialDescription": "Необязательный серийный номер счетчика. Редактируется в личном кабинете Ватериус.",
       "wateriusDeviceTitle": "Устройство",
       "wateriusDeviceNameTitle": "Название устройства",
-      "wateriusDeviceNameDescription": "Название устройства в личном кабинете Ватериус. Обновляется в кабинете при каждой отправке показаний.",
+      "wateriusDeviceNameDescription": "Название устройства в личном кабинете Ватериус. Обновляется в кабинете при каждой отправке показаний. Оставьте пустым, чтобы сохранить название, заданное в кабинете.",
       "wateriusDeviceKeyTitle": "Ключ",
       "wateriusDeviceKeyDescription": "Уникальный ключ устройства. Войдите на account.waterius.ru, добавьте устройство (Умный дом -> WirenBoard), скопируйте ключ.",
       "wateriusMetersTitle": "Счетчики",

@@ -9,10 +9,10 @@ from wb.mqtt_waterius import config
 
 def _valid_config() -> dict:
     return {
-        "send_time": "03:30",
-        "days": ["monday"],
+        "sendTime": "03:30",
+        "daysOfWeek": ["monday"],
         "devices": [
-            {"key": "K", "channels": [{"topic": "waterius-demo/cold_water", "data_type": 0}]},
+            {"key": "K", "channels": [{"mqttTopicName": "waterius-demo/cold_water", "dataType": 0}]},
         ],
     }
 
@@ -49,60 +49,65 @@ def test_all_topics() -> None:
 @pytest.mark.parametrize(
     "bad",
     [
-        pytest.param({"send_time": "25:00", "devices": []}, id="bad-time"),
-        pytest.param({"days": ["monday"], "devices": []}, id="send-time-absent"),
-        pytest.param({"send_time": "03:00", "days": ["monday"]}, id="devices-key-absent"),
+        pytest.param({"sendTime": "25:00", "devices": []}, id="bad-time"),
+        pytest.param({"daysOfWeek": ["monday"], "devices": []}, id="send-time-absent"),
+        pytest.param({"sendTime": "03:00", "daysOfWeek": ["monday"]}, id="devices-key-absent"),
         pytest.param(
-            {"send_time": "03:00", "devices": [{"key": "K", "channels": []}]}, id="device-without-channels"
+            {"sendTime": "03:00", "devices": [{"key": "K", "channels": []}]}, id="device-without-channels"
         ),
         pytest.param(
-            {"send_time": "03:00", "devices": [{"channels": [{"topic": "d/c", "data_type": 0}]}]},
+            {"sendTime": "03:00", "devices": [{"channels": [{"mqttTopicName": "d/c", "dataType": 0}]}]},
             id="device-without-key",
         ),
         pytest.param(
             {
-                "send_time": "03:00",
-                "devices": [{"key": "K", "channels": [{"topic": "nodash", "data_type": 0}]}],
+                "sendTime": "03:00",
+                "devices": [{"key": "K", "channels": [{"mqttTopicName": "nodash", "dataType": 0}]}],
             },
             id="channel-bad-topic",
         ),
         pytest.param(
-            {"send_time": "03:00", "devices": [{"key": "K", "channels": [{"topic": "d/c"}]}]},
-            id="channel-without-type",
+            {"sendTime": "03:00", "devices": [{"key": "K", "channels": [{"mqttTopicName": "d/c"}]}]},
+            id="channel-without-data-type",
         ),
         pytest.param(
             {
-                "send_time": "03:00",
-                "devices": [{"key": "K", "channels": [{"topic": "d/c", "data_type": "abc"}]}],
+                "sendTime": "03:00",
+                "devices": [{"key": "K", "channels": [{"mqttTopicName": "d/c", "dataType": "abc"}]}],
             },
-            id="channel-non-numeric-type",
+            id="channel-non-numeric-data-type",
         ),
         pytest.param(
             {
-                "send_time": "03:00",
-                "devices": [{"key": "K", "channels": [{"topic": "d/c", "data_type": 42}]}],
+                "sendTime": "03:00",
+                "devices": [{"key": "K", "channels": [{"mqttTopicName": "d/c", "dataType": 42}]}],
             },
-            id="channel-unknown-type",
+            id="channel-unknown-data-type",
         ),
-        pytest.param({"send_time": "03:00", "devices": [], "days": []}, id="empty-days"),
-        pytest.param({"send_time": "03:00", "devices": [], "days": ["notaday"]}, id="days-all-invalid"),
+        pytest.param({"sendTime": "03:00", "devices": [], "daysOfWeek": []}, id="empty-days"),
+        pytest.param({"sendTime": "03:00", "devices": [], "daysOfWeek": ["notaday"]}, id="days-all-invalid"),
+        pytest.param(
+            {"sendTime": "03:00", "devices": [], "daysOfWeek": ["monday", "tuesdya"]},
+            id="days-partially-invalid",
+        ),
+        pytest.param({"sendTime": "03:00", "devices": [], "daysOfWeek": ["monday", 3]}, id="days-not-a-name"),
         pytest.param(
             {
-                "send_time": "03:00",
-                "days": ["monday"],
+                "sendTime": "03:00",
+                "daysOfWeek": ["monday"],
                 "devices": [
-                    {"key": "K", "channels": [{"topic": f"d/c{i}", "data_type": 0} for i in range(5)]}
+                    {"key": "K", "channels": [{"mqttTopicName": f"d/c{i}", "dataType": 0} for i in range(5)]}
                 ],
             },
             id="too-many-channels",
         ),
         pytest.param(
             {
-                "send_time": "03:00",
-                "days": ["monday"],
+                "sendTime": "03:00",
+                "daysOfWeek": ["monday"],
                 "devices": [
-                    {"key": "DUP", "channels": [{"topic": "d/a", "data_type": 0}]},
-                    {"key": "DUP", "channels": [{"topic": "d/b", "data_type": 1}]},
+                    {"key": "DUP", "channels": [{"mqttTopicName": "d/a", "dataType": 0}]},
+                    {"key": "DUP", "channels": [{"mqttTopicName": "d/b", "dataType": 1}]},
                 ],
             },
             id="duplicate-key",
@@ -116,13 +121,15 @@ def test_invalid_config_raises(bad: dict) -> None:
 
 def test_empty_device_list_allowed() -> None:
     # Fresh-install state: must parse, the daemon idles instead of crash-looping.
-    data = {"send_time": "03:00", "days": ["monday"], "devices": []}
+    data = {"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}
     assert config.parse_config(data).devices == []
 
 
 def test_days_subset_parsed_to_weekday_indices() -> None:
-    cfg = config.parse_config({"send_time": "03:00", "devices": [], "days": ["monday", "friday", "sunday"]})
-    assert cfg.days == {0, 4, 6}  # Monday=0, Friday=4, Sunday=6
+    cfg = config.parse_config(
+        {"sendTime": "03:00", "devices": [], "daysOfWeek": ["monday", "friday", "sunday"]}
+    )
+    assert cfg.days_of_week == {0, 4, 6}  # Monday=0, Friday=4, Sunday=6
 
 
 def test_load_config_reads_file(tmp_path: Path) -> None:
@@ -142,21 +149,21 @@ def test_load_config_missing_file_raises(tmp_path: Path) -> None:
 def test_load_config_broken_json_raises(tmp_path: Path) -> None:
     # Hand-edited file with a trailing comma or a missing brace: one ConfigError for the caller.
     path = tmp_path / "wb-mqtt-waterius.conf"
-    path.write_text('{"send_time": "03:00",}', encoding="utf-8")
+    path.write_text('{"sendTime": "03:00",}', encoding="utf-8")
     with pytest.raises(config.ConfigError):
         config.load_config(str(path))
 
 
 def test_channel_serial_optional() -> None:
     data = {
-        "send_time": "03:00",
-        "days": ["monday"],
+        "sendTime": "03:00",
+        "daysOfWeek": ["monday"],
         "devices": [
             {
                 "key": "K",
                 "channels": [
-                    {"topic": "d/a", "data_type": 0, "serial": "1001"},
-                    {"topic": "d/b", "data_type": 1},
+                    {"mqttTopicName": "d/a", "dataType": 0, "serial": "1001"},
+                    {"mqttTopicName": "d/b", "dataType": 1},
                 ],
             }
         ],
