@@ -12,6 +12,7 @@
 .gitignore text=auto eol=lf
 .gitattributes text=auto eol=lf
 Jenkinsfile text=auto eol=lf
+pytest.ini text=auto eol=lf
 10wb-mqtt-waterius text=auto eol=lf
 
 # Folder ./bin

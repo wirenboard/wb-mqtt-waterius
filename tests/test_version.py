@@ -1,42 +1,22 @@
-"""Version contract guard.
-
-setup.py derives the package version from debian/changelog, which is the single
-source of truth. This test checks the version is well-formed (MAJOR.MINOR.PATCH),
-which the WB Debian packaging expects.
-"""
-
-from __future__ import annotations
-
-import importlib.util
 import re
-import types
-from pathlib import Path
 
-import pytest
-import setuptools
+from wb.mqtt_waterius.version import get_version
 
-
-def _repo_root() -> Path:
-    # Walk up to the dir with setup.py and debian/changelog. Under pybuild the test
-    # runs below the unpacked source root, so parent.parent won't reach it.
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "setup.py").is_file() and (parent / "debian" / "changelog").is_file():
-            return parent
-    raise RuntimeError("repo root with setup.py and debian/changelog not found")
+# WB Debian packaging expects exactly MAJOR.MINOR.PATCH. Neither dpkg nor PEP 440 enforces it,
+# both accept 1.0 and 1.2.3.4, so this test is the only thing that does.
+RELEASE_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 
 
-def _load_setup(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    # setup.py calls setuptools.setup() at import and reads debian/changelog relative
-    # to the cwd, so stub the call and run from the repo root.
-    root = _repo_root()
-    monkeypatch.chdir(root)
-    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
-    spec = importlib.util.spec_from_file_location("_waterius_setup", root / "setup.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _is_release_version(package_version: str) -> bool:
+    return RELEASE_VERSION_PATTERN.fullmatch(package_version) is not None
 
 
-def test_changelog_version_is_three_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
-    version = _load_setup(monkeypatch).get_version()
-    assert re.match(r"^\d+\.\d+\.\d+$", version), f"expected MAJOR.MINOR.PATCH, got {version!r}"
+def test_installed_version_is_release_version() -> None:
+    package_version = get_version()
+    assert _is_release_version(
+        package_version
+    ), f"package version '{package_version}' is not MAJOR.MINOR.PATCH, fix debian/changelog"
+
+
+def test_four_part_version_is_rejected() -> None:
+    assert not _is_release_version("1.0.0.1")

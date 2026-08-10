@@ -3,6 +3,6 @@
 
 import sys
 
-from wb.mqtt_waterius.cli import main
+from wb.mqtt_waterius.main import main
 
 sys.exit(main(sys.argv[1:]))

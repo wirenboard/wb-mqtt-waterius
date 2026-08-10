@@ -1,14 +1,10 @@
-pyproject.toml
+.devcontainer/
+.vscode/
 .coveragerc
+pyproject.toml
 
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
 .pytest_cache/
-build/
-.pybuild/
-debian/wb-mqtt-waterius/
-debian/.debhelper/
-debian/files
-debian/*.substvars
-debian/*.debhelper.log
