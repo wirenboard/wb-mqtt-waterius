@@ -1,0 +1,4 @@
+schemas/wb-mqtt-waterius.schema.json usr/share/wb-mqtt-confed/schemas/
+config/wb-mqtt-waterius.conf etc/
+# Keep the user's config across firmware updates and factory resets (wb-configs)
+10wb-mqtt-waterius etc/wb-configs.d/
