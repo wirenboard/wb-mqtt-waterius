@@ -1,0 +1,250 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "title": "wateriusTitle",
+  "description": "wateriusDescription",
+  "configFile": {
+    "path": "/etc/wb-mqtt-waterius.conf",
+    "service": "wb-mqtt-waterius"
+  },
+  "_format": "grid-strict",
+  "properties": {
+    "sendTime": {
+      "type": "string",
+      "propertyOrder": 1,
+      "title": "wateriusSendTimeTitle",
+      "description": "wateriusSendTimeDescription",
+      "_format": "time",
+      "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+      "default": "03:00",
+      "options": {
+        "patternmessage": "wateriusSendTimePatternMessage",
+        "grid_columns": 6,
+        "grid_break": true
+      }
+    },
+    "daysOfWeek": {
+      "type": "array",
+      "propertyOrder": 2,
+      "title": "wateriusSendDaysTitle",
+      "description": "wateriusSendDaysDescription",
+      "_format": "checkbox",
+      "options": {
+        "grid_columns": 12,
+        "grid_break": true
+      },
+      "uniqueItems": true,
+      "minItems": 1,
+      "default": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+      "items": {
+        "type": "string",
+        "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+        "options": {
+          "enum_titles": [
+            "wateriusDayMonday",
+            "wateriusDayTuesday",
+            "wateriusDayWednesday",
+            "wateriusDayThursday",
+            "wateriusDayFriday",
+            "wateriusDaySaturday",
+            "wateriusDaySunday"
+          ]
+        }
+      }
+    },
+    "devices": {
+      "type": "array",
+      "propertyOrder": 3,
+      "title": "wateriusDevicesTitle",
+      "description": "wateriusDevicesDescription",
+      "minItems": 0,
+      "options": {
+        "array_controls_top": true,
+        "disable_array_delete_last_row": true,
+        "disable_array_reorder": true,
+        "grid_columns": 12
+      },
+      "items": {
+        "type": "object",
+        "title": "wateriusDeviceTitle",
+        "headerTemplate": "{{self.name}}",
+        "options": {
+          "disable_edit_json": true,
+          "disable_properties": true
+        },
+        "properties": {
+          "key": {
+            "type": "string",
+            "propertyOrder": 1,
+            "title": "wateriusDeviceKeyTitle",
+            "description": "wateriusDeviceKeyDescription",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "propertyOrder": 2,
+            "title": "wateriusDeviceNameTitle",
+            "description": "wateriusDeviceNameDescription",
+            "maxLength": 30,
+            "default": ""
+          },
+          "channels": {
+            "type": "array",
+            "propertyOrder": 3,
+            "title": "wateriusMetersTitle",
+            "description": "wateriusMetersDescription",
+            "minItems": 1,
+            "maxItems": 4,
+            "_format": "table",
+            "options": {
+              "disable_collapse": true,
+              "array_controls_top": true,
+              "disable_array_reorder": true,
+              "wb": {
+                "disable_panel": true
+              }
+            },
+            "items": {
+              "type": "object",
+              "title": "wateriusChannelTitle",
+              "headerTemplate": "{{self.mqttTopicName}}",
+              "properties": {
+                "mqttTopicName": {
+                  "type": "string",
+                  "propertyOrder": 1,
+                  "title": "wateriusChannelTopicTitle",
+                  "pattern": "^[^/+#]+/[^/+#]+$",
+                  "minLength": 3,
+                  "_format": "wb-autocomplete",
+                  "options": {
+                    "patternmessage": "wateriusChannelTopicPatternMessage",
+                    "wb": {
+                      "data": "devices"
+                    }
+                  }
+                },
+                "dataType": {
+                  "type": "integer",
+                  "propertyOrder": 2,
+                  "title": "wateriusDataTypeTitle",
+                  "enum": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                  "default": 0,
+                  "options": {
+                    "enum_titles": [
+                      "wateriusDataTypeColdWater",
+                      "wateriusDataTypeHotWater",
+                      "wateriusDataTypeElectricitySingle",
+                      "wateriusDataTypeGas",
+                      "wateriusDataTypeHeat",
+                      "wateriusDataTypeElectricityDay",
+                      "wateriusDataTypeElectricityNight",
+                      "wateriusDataTypeElectricityPeak",
+                      "wateriusDataTypeElectricitySemiPeak",
+                      "wateriusDataTypeDrinkingWater"
+                    ]
+                  }
+                },
+                "serial": {
+                  "type": "string",
+                  "propertyOrder": 3,
+                  "title": "wateriusChannelSerialTitle",
+                  "description": "wateriusChannelSerialDescription"
+                }
+              },
+              "required": ["mqttTopicName", "dataType"]
+            }
+          }
+        },
+        "required": ["key", "name", "channels"]
+      }
+    }
+  },
+  "required": ["sendTime", "daysOfWeek", "devices"],
+  "options": {
+    "disable_collapse": true
+  },
+  "translations": {
+    "en": {
+      "wateriusTitle": "Submit Meter Readings to Waterius",
+      "wateriusDescription": "Send readings of meters connected to Wiren Board to the waterius.ru personal cabinet.",
+      "wateriusChannelTitle": "Channel",
+      "wateriusChannelTopicTitle": "MQTT Control",
+      "wateriusChannelTopicPatternMessage": "Specify the control as device/control",
+      "wateriusDataTypeTitle": "Meter Type",
+      "wateriusDataTypeColdWater": "Cold Water",
+      "wateriusDataTypeHotWater": "Hot Water",
+      "wateriusDataTypeElectricitySingle": "Electricity",
+      "wateriusDataTypeGas": "Gas",
+      "wateriusDataTypeHeat": "Heat",
+      "wateriusDataTypeElectricityDay": "Electricity (Day)",
+      "wateriusDataTypeElectricityNight": "Electricity (Night)",
+      "wateriusDataTypeElectricityPeak": "Electricity (Peak)",
+      "wateriusDataTypeElectricitySemiPeak": "Electricity (Semi-Peak)",
+      "wateriusDataTypeDrinkingWater": "Potable Water",
+      "wateriusChannelSerialTitle": "Serial Number",
+      "wateriusChannelSerialDescription": "Optional meter serial number. Edit it in the Waterius personal cabinet.",
+      "wateriusDeviceTitle": "Device",
+      "wateriusDeviceNameTitle": "Device Name",
+      "wateriusDeviceNameDescription": "Device name in the Waterius personal cabinet. Updated there on every reading upload. Leave empty to keep the name set in the cabinet.",
+      "wateriusDeviceKeyTitle": "API Key",
+      "wateriusDeviceKeyDescription": "Unique device key. Log in to account.waterius.ru, add a device (Smart home -> WirenBoard), copy the key.",
+      "wateriusMetersTitle": "Meters",
+      "wateriusMetersDescription": "Up to 4 meters per key. For more meters add another device with its own key.",
+      "wateriusSendTimeTitle": "Send Time",
+      "wateriusSendTimeDescription": "Time of day to send automatically on the selected days.",
+      "wateriusSendTimePatternMessage": "Time must be in HH:MM format, e.g. 03:00",
+      "wateriusSendDaysTitle": "Send Days",
+      "wateriusSendDaysDescription": "Days of the week to send readings on.",
+      "wateriusDayMonday": "Monday",
+      "wateriusDayTuesday": "Tuesday",
+      "wateriusDayWednesday": "Wednesday",
+      "wateriusDayThursday": "Thursday",
+      "wateriusDayFriday": "Friday",
+      "wateriusDaySaturday": "Saturday",
+      "wateriusDaySunday": "Sunday",
+      "wateriusDevicesTitle": "Waterius Devices",
+      "wateriusDevicesDescription": "One key = one Waterius device = up to 4 meters."
+    },
+    "ru": {
+      "wateriusTitle": "Подача показаний счетчиков в Ватериус",
+      "wateriusDescription": "Отправка показаний счетчиков, подключенных к Wiren Board, в личный кабинет waterius.ru.",
+      "wateriusChannelTitle": "Канал",
+      "wateriusChannelTopicTitle": "Контрол MQTT",
+      "wateriusChannelTopicPatternMessage": "Укажите контрол в виде device/control",
+      "wateriusDataTypeTitle": "Тип счетчика",
+      "wateriusDataTypeColdWater": "Холодная вода",
+      "wateriusDataTypeHotWater": "Горячая вода",
+      "wateriusDataTypeElectricitySingle": "Электричество",
+      "wateriusDataTypeGas": "Газ",
+      "wateriusDataTypeHeat": "Отопление",
+      "wateriusDataTypeElectricityDay": "Электричество (День)",
+      "wateriusDataTypeElectricityNight": "Электричество (Ночь)",
+      "wateriusDataTypeElectricityPeak": "Электричество (Пик)",
+      "wateriusDataTypeElectricitySemiPeak": "Электричество (Полупик)",
+      "wateriusDataTypeDrinkingWater": "Питьевая вода",
+      "wateriusChannelSerialTitle": "Серийный номер",
+      "wateriusChannelSerialDescription": "Необязательный серийный номер счетчика. Редактируется в личном кабинете Ватериус.",
+      "wateriusDeviceTitle": "Устройство",
+      "wateriusDeviceNameTitle": "Название устройства",
+      "wateriusDeviceNameDescription": "Название устройства в личном кабинете Ватериус. Обновляется в кабинете при каждой отправке показаний. Оставьте пустым, чтобы сохранить название, заданное в кабинете.",
+      "wateriusDeviceKeyTitle": "Ключ",
+      "wateriusDeviceKeyDescription": "Уникальный ключ устройства. Войдите на account.waterius.ru, добавьте устройство (Умный дом -> WirenBoard), скопируйте ключ.",
+      "wateriusMetersTitle": "Счетчики",
+      "wateriusMetersDescription": "До 4 счетчиков на один ключ. Для большего числа добавьте еще устройство со своим ключом.",
+      "wateriusSendTimeTitle": "Время отправки",
+      "wateriusSendTimeDescription": "Время автоматической отправки в выбранные дни.",
+      "wateriusSendTimePatternMessage": "Время в формате ЧЧ:ММ, например 03:00",
+      "wateriusSendDaysTitle": "Дни отправки",
+      "wateriusSendDaysDescription": "Дни недели, по которым отправлять показания.",
+      "wateriusDayMonday": "Понедельник",
+      "wateriusDayTuesday": "Вторник",
+      "wateriusDayWednesday": "Среда",
+      "wateriusDayThursday": "Четверг",
+      "wateriusDayFriday": "Пятница",
+      "wateriusDaySaturday": "Суббота",
+      "wateriusDaySunday": "Воскресенье",
+      "wateriusDevicesTitle": "Устройства Ватериус",
+      "wateriusDevicesDescription": "Один ключ = одно устройство Ватериус, до 4 счетчиков."
+    }
+  }
+}
