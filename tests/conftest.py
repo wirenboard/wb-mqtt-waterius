@@ -10,7 +10,7 @@ from wb.mqtt_waterius.config import WEEKDAYS
 ALL_DAYS = set(range(len(WEEKDAYS)))
 
 
-class FakeMessageInfo:
+class FakeMessageInfo:  # pylint: disable=too-few-public-methods
     """
     Stand-in for paho's MQTTMessageInfo returned by publish().
 

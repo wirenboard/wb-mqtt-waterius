@@ -13,7 +13,7 @@ KEY_DEVICE1 = "/devices/wb-mqtt-waterius_1"
 KEY_DEVICE2 = "/devices/wb-mqtt-waterius_2"
 
 
-class _Msg:
+class _Msg:  # pylint: disable=too-few-public-methods
     def __init__(self, payload: str, topic: str = "") -> None:
         self.payload = payload.encode()
         self.topic = topic
@@ -26,7 +26,7 @@ def _matches(wildcard: str, topic: str) -> bool:
     )
 
 
-class _DeliveringClient(FakeClient):
+class _DeliveringClient(FakeClient):  # pylint: disable=too-few-public-methods
     """
     FakeClient that answers a subscription with retained messages, the way a broker does.
     """

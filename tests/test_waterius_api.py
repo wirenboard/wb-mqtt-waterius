@@ -1,4 +1,5 @@
 import threading
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import pytest
@@ -7,10 +8,10 @@ import requests
 from wb.mqtt_waterius import waterius_api
 
 
+@dataclass
 class _FakeResponse:
-    def __init__(self, status_code: int, text: str = "") -> None:
-        self.status_code = status_code
-        self.text = text
+    status_code: int
+    text: str = ""
 
 
 class _FakeSession:
@@ -30,7 +31,7 @@ class _FakeSession:
         self.closed = True
 
 
-class _SeqSession:
+class _SeqSession:  # pylint: disable=too-few-public-methods
     """
     Returns a queued sequence of responses, one per post() call.
 

@@ -32,8 +32,7 @@ DRIVER = "wb-mqtt-waterius"
 
 _KEY_DEVICE_ID_RE = re.compile(r"^wb-mqtt-waterius_\d+$")
 
-# Retained messages arrive in a burst right after the subscription, so a scan ends on a pause in
-# the burst instead of on a fixed window.
+# A scan of retained topics ends once the broker has been silent for this long.
 _SCAN_IDLE_TIMEOUT = 0.1
 
 
