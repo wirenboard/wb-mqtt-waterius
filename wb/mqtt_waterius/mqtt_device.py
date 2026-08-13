@@ -28,8 +28,7 @@ from wb.mqtt_waterius.config import Config, Device
 from wb.mqtt_waterius.waterius_api import mask_key
 
 DEVICE_ID_PREFIX = "wb_mqtt_waterius"
-INTEGRATION_DEVICE_ID = DEVICE_ID_PREFIX
-INTEGRATION_DEVICE_BASE = f"/devices/{INTEGRATION_DEVICE_ID}"
+INTEGRATION_DEVICE_BASE = f"/devices/{DEVICE_ID_PREFIX}"
 DRIVER = "wb-mqtt-waterius"
 
 _KEY_DEVICE_ID_RE = re.compile(rf"^{re.escape(DEVICE_ID_PREFIX)}_\d+$")
@@ -44,7 +43,7 @@ _DISCOVERY_WILDCARDS = ["/devices/+/meta/#", "/devices/+/controls/+/meta/#"]
 
 # Our own topic, outside the device tree so a scan of our devices cannot pick up its own
 # marker. Published without retain, so the broker keeps nothing.
-_SCAN_MARKER_TOPIC = "/wb_mqtt_waterius/scan"
+_MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 
 # Guard for a broker that answers nothing. It bounds the whole retained burst, not just its
 # first message, so it has room for a large installation.
@@ -172,44 +171,59 @@ def _is_our_device(device_id: str) -> bool:
         >>> _is_our_device("wb-mqtt-serial")
         False
     """
-    return device_id == INTEGRATION_DEVICE_ID or bool(_KEY_DEVICE_ID_RE.match(device_id))
+    return device_id == DEVICE_ID_PREFIX or bool(_KEY_DEVICE_ID_RE.match(device_id))
 
 
-def _publish(client: MQTTClient, topic: str, value: str) -> Any:
-    return client.publish(topic, value, retain=True, qos=1)
+def _publish(client: MQTTClient, topic: str, value: str) -> None:
+    client.publish(topic, value, retain=True, qos=1)
+
+
+def wait_for_broker(client: MQTTClient, timeout: float = _SCAN_TIMEOUT) -> bool:
+    """
+    Block until the broker has handled everything published before this call.
+
+    Publishes a token to our own topic and waits for it back. A broker handles one client's
+    packets in order, so the token returning means our earlier ones are through. The token is
+    unique per call, so a stale one or another process's cannot end this wait.
+
+    Returns:
+        False if the token did not come back within the timeout
+    """
+    arrived = threading.Event()
+    marker = uuid.uuid4().hex.encode()
+
+    def _on_marker(_client: MQTTClient, _userdata: Any, message: Any) -> None:
+        if message.payload == marker:
+            arrived.set()
+
+    client.message_callback_add(_MARKER_TOPIC, _on_marker)
+    client.subscribe(_MARKER_TOPIC)
+    client.publish(_MARKER_TOPIC, marker, qos=1)
+    confirmed = arrived.wait(timeout)
+    client.unsubscribe(_MARKER_TOPIC)
+    client.message_callback_remove(_MARKER_TOPIC)
+    return confirmed
 
 
 def _scan_retained(client: MQTTClient, wildcards: list[str], timeout: float = _SCAN_TIMEOUT) -> list[str]:
     """
     Collect every non-empty retained topic matching the wildcards.
 
-    The broker queues the retained set while it processes the subscription and handles our
-    later publish after it, so a marker message of our own comes back once the set is in.
-    Every scan makes its own token, so neither a marker left over from a scan that hit the
-    timeout nor one from another process of ours, which shares this topic, can end this scan.
-    Callbacks are registered before the subscription, otherwise a retained message answering
-    it could arrive before there is anything to collect it.
+    The broker queues the retained set while it processes our subscriptions, so waiting for it
+    to catch up ends the burst. Callbacks are registered before the subscription, otherwise a
+    retained message answering it could arrive before there is anything to collect it.
     """
     topics: list[str] = []
-    complete = threading.Event()
-    marker = uuid.uuid4().hex.encode()
 
     def _collect_topic(_client: MQTTClient, _userdata: Any, message: Any) -> None:
         if message.payload:
             topics.append(message.topic)
 
-    def _on_marker(_client: MQTTClient, _userdata: Any, message: Any) -> None:
-        if message.payload == marker:
-            complete.set()
-
-    client.message_callback_add(_SCAN_MARKER_TOPIC, _on_marker)
-    client.subscribe(_SCAN_MARKER_TOPIC)
     for wildcard in wildcards:
         client.message_callback_add(wildcard, _collect_topic)
         client.subscribe(wildcard)
-    client.publish(_SCAN_MARKER_TOPIC, marker, qos=1)
-    complete.wait(timeout)
-    for wildcard in wildcards + [_SCAN_MARKER_TOPIC]:
+    wait_for_broker(client, timeout)
+    for wildcard in wildcards:
         client.unsubscribe(wildcard)
         client.message_callback_remove(wildcard)
     return topics
@@ -222,7 +236,7 @@ def _discover_our_device_ids(client: MQTTClient, timeout: float) -> list[str]:
     Scans meta topics only, both a device's own and its controls', so a device whose own
     ``/meta`` is gone is still found by its controls.
     """
-    ids = {INTEGRATION_DEVICE_ID}
+    ids = {DEVICE_ID_PREFIX}
     for topic in _scan_retained(client, _DISCOVERY_WILDCARDS, timeout):
         parts = topic.split("/")  # ['', 'devices', <id>, ...]
         if len(parts) >= 3 and _is_our_device(parts[2]):

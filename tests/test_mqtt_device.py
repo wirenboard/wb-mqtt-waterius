@@ -9,7 +9,7 @@ from tests.conftest import ALL_DAYS, FakeClient, Message, topic_matches
 from wb.mqtt_waterius import mqtt_device
 from wb.mqtt_waterius.config import Channel, Config, Device
 
-SCAN_MARKER_TOPIC = "/wb_mqtt_waterius/scan"
+MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 INTEGRATION_BASE = mqtt_device.INTEGRATION_DEVICE_BASE
 KEY_DEVICE1_BASE = f"/devices/{mqtt_device.build_key_device_id(1)}"
 KEY_DEVICE2_BASE = f"/devices/{mqtt_device.build_key_device_id(2)}"
@@ -36,11 +36,11 @@ class _DeliveringClient(FakeClient):  # pylint: disable=too-few-public-methods
 
 class _StaleMarkerClient(_DeliveringClient):  # pylint: disable=too-few-public-methods
     """
-    Delivering client that answers the scan marker with the token of another scan.
+    Delivering client that answers the marker topic with someone else's token.
     """
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
-        if topic == SCAN_MARKER_TOPIC:
+        if topic == MARKER_TOPIC:
             payload = b"other-scan"
         super().publish(topic, payload, retain, qos)
 
@@ -313,12 +313,23 @@ def test_clear_all_wipes_our_leftovers_and_spares_foreign_devices() -> None:
     assert f"{foreign_base}/controls/temp/meta" not in published
 
 
+def test_wait_for_broker_confirms_when_its_token_returns() -> None:
+    client = FakeClient()
+    assert mqtt_device.wait_for_broker(client, timeout=1) is True
+    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
+
+
+def test_wait_for_broker_reports_an_unconfirmed_wait() -> None:
+    # Someone else's token on the shared topic must not pass for ours.
+    assert mqtt_device.wait_for_broker(_StaleMarkerClient({}), timeout=0.05) is False
+
+
 def test_scan_ends_on_its_own_marker_and_not_on_the_timeout() -> None:
     client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
     started = time.monotonic()
     mqtt_device.clear_all(client, timeout=30)
     assert time.monotonic() - started < 1
-    assert SCAN_MARKER_TOPIC in [topic for topic, *_ in client.published]
+    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
 
 
 def test_scan_falls_back_to_the_timeout_when_the_marker_is_not_ours() -> None:
