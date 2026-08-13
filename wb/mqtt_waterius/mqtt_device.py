@@ -3,9 +3,9 @@ Virtual WB devices published by the service.
 
 Topology:
 
-* an integration device ``/devices/wb-mqtt-waterius`` — the automatic-sending switch plus
+* an integration device ``/devices/wb_mqtt_waterius`` — the automatic-sending switch plus
   read-only status (state, version, current time, next send).
-* one device per key ``/devices/wb-mqtt-waterius_<N>`` (1-based) — typed read-only
+* one device per key ``/devices/wb_mqtt_waterius_<N>`` (1-based) — typed read-only
   channel mirrors plus per-device "Last Sent" and "Last Error". Titled by the configured
   device name, or by a masked key prefix when there is none.
 
@@ -17,23 +17,38 @@ state.
 import json
 import re
 import threading
+import uuid
 from collections import Counter
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from wb_common.mqtt_client import MQTTClient
 
 from wb.mqtt_waterius.config import Config, Device
 from wb.mqtt_waterius.waterius_api import mask_key
 
-DEVICE_ID = "wb-mqtt-waterius"
-DEVICE_BASE = f"/devices/{DEVICE_ID}"
+DEVICE_ID_PREFIX = "wb_mqtt_waterius"
+INTEGRATION_DEVICE_ID = DEVICE_ID_PREFIX
+INTEGRATION_DEVICE_BASE = f"/devices/{INTEGRATION_DEVICE_ID}"
 DRIVER = "wb-mqtt-waterius"
 
-_KEY_DEVICE_ID_RE = re.compile(r"^wb-mqtt-waterius_\d+$")
+_KEY_DEVICE_ID_RE = re.compile(rf"^{re.escape(DEVICE_ID_PREFIX)}_\d+$")
 
-# A scan of retained topics ends once the broker has been silent for this long.
-_SCAN_IDLE_TIMEOUT = 0.1
+# Error flag for a control, see "Errors" in the WB conventions. Sending a reading out to the
+# cloud is a write, so "w".
+_ERROR_FLAG = "w"
+
+# Finding our devices needs meta topics only. The "#" catches the JSON meta and per-field
+# meta subtopics alike.
+_DISCOVERY_WILDCARDS = ["/devices/+/meta/#", "/devices/+/controls/+/meta/#"]
+
+# Our own topic, outside the device tree so a scan of our devices cannot pick up its own
+# marker. Published without retain, so the broker keeps nothing.
+_SCAN_MARKER_TOPIC = "/wb_mqtt_waterius/scan"
+
+# Guard for a broker that answers nothing. It bounds the whole retained burst, not just its
+# first message, so it has room for a large installation.
+_SCAN_TIMEOUT = 5.0
 
 
 # data_type code -> (WB control type, units, bilingual title). All meters use the generic
@@ -66,73 +81,83 @@ STATE_ENUM = {
     STATE_HAS_ERRORS: {"en": "Has Errors", "ru": "Есть ошибки"},
 }
 
+
+class Control(NamedTuple):
+    """
+    One WB control — the id it takes in the topic tree and the meta published for it.
+    """
+
+    id: str
+    meta: dict
+
+
 # Integration-device controls, in display order.
-STATUS_CONTROLS = [
-    (
-        "enabled",
-        {
-            "type": "switch",
-            "order": 1,
-            "title": {"en": "Integration Enabled", "ru": "Интеграция включена"},
-        },
-    ),
-    (
-        "state",
-        {
-            "type": "value",
-            "readonly": True,
-            "order": 2,
-            "title": {"en": "State", "ru": "Состояние"},
-            "enum": STATE_ENUM,
-        },
-    ),
-    (
-        "version",
-        {"type": "text", "readonly": True, "order": 3, "title": {"en": "Version", "ru": "Версия"}},
-    ),
-    (
-        "current_time",
-        {
-            "type": "text",
-            "readonly": True,
-            "order": 4,
-            "title": {"en": "Current Time", "ru": "Текущее время"},
-        },
-    ),
-    (
-        "next_execution",
-        {
-            "type": "text",
-            "readonly": True,
-            "order": 5,
-            "title": {"en": "Next Send", "ru": "Следующая отправка"},
-        },
-    ),
-]
+STATUS_ENABLED = Control(
+    "enabled",
+    {
+        "type": "switch",
+        "order": 1,
+        "title": {"en": "Integration Enabled", "ru": "Интеграция включена"},
+    },
+)
+STATUS_STATE = Control(
+    "state",
+    {
+        "type": "value",
+        "readonly": True,
+        "order": 2,
+        "title": {"en": "State", "ru": "Состояние"},
+        "enum": STATE_ENUM,
+    },
+)
+STATUS_VERSION = Control(
+    "version",
+    {"type": "text", "readonly": True, "order": 3, "title": {"en": "Version", "ru": "Версия"}},
+)
+STATUS_CURRENT_TIME = Control(
+    "current_time",
+    {
+        "type": "text",
+        "readonly": True,
+        "order": 4,
+        "title": {"en": "Current Time", "ru": "Текущее время"},
+    },
+)
+STATUS_NEXT_EXECUTION = Control(
+    "next_execution",
+    {
+        "type": "text",
+        "readonly": True,
+        "order": 5,
+        "title": {"en": "Next Send", "ru": "Следующая отправка"},
+    },
+)
+
+STATUS_CONTROLS = [STATUS_ENABLED, STATUS_STATE, STATUS_VERSION, STATUS_CURRENT_TIME, STATUS_NEXT_EXECUTION]
 
 # Per-device controls: "Last Sent" on top (order 1), channels in between (order 2..),
 # "Last Error" at the bottom (order 100).
-KEY_LAST_SENT = (
+KEY_LAST_SENT = Control(
     "last_sent",
     {"type": "text", "readonly": True, "order": 1, "title": {"en": "Last Sent", "ru": "Отправлено"}},
 )
-KEY_LAST_ERROR = (
+KEY_LAST_ERROR = Control(
     "last_error",
     {"type": "text", "readonly": True, "order": 100, "title": {"en": "Errors", "ru": "Ошибки"}},
 )
 
 
-def key_device_id(index: int) -> str:
+def build_key_device_id(index: int) -> str:
     """
     Device id for the 1-based key index.
 
     Examples:
-        >>> key_device_id(1)
-        'wb-mqtt-waterius_1'
-        >>> key_device_id(12)
-        'wb-mqtt-waterius_12'
+        >>> build_key_device_id(1)
+        'wb_mqtt_waterius_1'
+        >>> build_key_device_id(12)
+        'wb_mqtt_waterius_12'
     """
-    return f"{DEVICE_ID}_{index}"
+    return f"{DEVICE_ID_PREFIX}_{index}"
 
 
 def _is_our_device(device_id: str) -> bool:
@@ -140,89 +165,99 @@ def _is_our_device(device_id: str) -> bool:
     Tell whether a device id found in the broker is published by this service.
 
     Examples:
-        >>> _is_our_device("wb-mqtt-waterius")
+        >>> _is_our_device("wb_mqtt_waterius")
         True
-        >>> _is_our_device("wb-mqtt-waterius_5")
+        >>> _is_our_device("wb_mqtt_waterius_5")
         True
         >>> _is_our_device("wb-mqtt-serial")
         False
     """
-    return device_id == DEVICE_ID or bool(_KEY_DEVICE_ID_RE.match(device_id))
+    return device_id == INTEGRATION_DEVICE_ID or bool(_KEY_DEVICE_ID_RE.match(device_id))
 
 
 def _publish(client: MQTTClient, topic: str, value: str) -> Any:
     return client.publish(topic, value, retain=True, qos=1)
 
 
-def _remove_control(client: MQTTClient, base: str, control_id: str) -> list[Any]:
-    return [
-        _publish(client, f"{base}/controls/{control_id}/meta", ""),
-        _publish(client, f"{base}/controls/{control_id}", ""),
-        _publish(client, f"{base}/controls/{control_id}/meta/error", ""),
-    ]
-
-
-def _scan_retained(client: MQTTClient, wildcards: list[str], settle: float) -> list[str]:
+def _scan_retained(client: MQTTClient, wildcards: list[str], timeout: float = _SCAN_TIMEOUT) -> list[str]:
     """
     Collect every non-empty retained topic matching the wildcards.
 
-    Subscribes and collects until the broker stops sending, waiting at most ``settle`` for the
-    first message. Callbacks are registered before the subscription, otherwise a retained
-    message answering it could arrive before there is anything to collect it.
+    The broker queues the retained set while it processes the subscription and handles our
+    later publish after it, so a marker message of our own comes back once the set is in.
+    Every scan makes its own token, so neither a marker left over from a scan that hit the
+    timeout nor one from another process of ours, which shares this topic, can end this scan.
+    Callbacks are registered before the subscription, otherwise a retained message answering
+    it could arrive before there is anything to collect it.
     """
     topics: list[str] = []
-    arrived = threading.Event()
+    complete = threading.Event()
+    marker = uuid.uuid4().hex.encode()
 
-    def _on_meta(_client: MQTTClient, _userdata: Any, message: Any) -> None:
+    def _collect_topic(_client: MQTTClient, _userdata: Any, message: Any) -> None:
         if message.payload:
             topics.append(message.topic)
-        arrived.set()
 
+    def _on_marker(_client: MQTTClient, _userdata: Any, message: Any) -> None:
+        if message.payload == marker:
+            complete.set()
+
+    client.message_callback_add(_SCAN_MARKER_TOPIC, _on_marker)
+    client.subscribe(_SCAN_MARKER_TOPIC)
     for wildcard in wildcards:
-        client.message_callback_add(wildcard, _on_meta)
+        client.message_callback_add(wildcard, _collect_topic)
         client.subscribe(wildcard)
-    receiving = arrived.wait(settle)
-    while receiving:
-        arrived.clear()
-        receiving = arrived.wait(_SCAN_IDLE_TIMEOUT)
-    for wildcard in wildcards:
+    client.publish(_SCAN_MARKER_TOPIC, marker, qos=1)
+    complete.wait(timeout)
+    for wildcard in wildcards + [_SCAN_MARKER_TOPIC]:
         client.unsubscribe(wildcard)
         client.message_callback_remove(wildcard)
     return topics
 
 
-def clear_all(client: MQTTClient, settle: float = 0.5) -> list[Any]:
+def _discover_our_device_ids(client: MQTTClient, timeout: float) -> list[str]:
+    """
+    Our device ids present in the broker, sorted, with the integration device always included.
+
+    Scans meta topics only, both a device's own and its controls', so a device whose own
+    ``/meta`` is gone is still found by its controls.
+    """
+    ids = {INTEGRATION_DEVICE_ID}
+    for topic in _scan_retained(client, _DISCOVERY_WILDCARDS, timeout):
+        parts = topic.split("/")  # ['', 'devices', <id>, ...]
+        if len(parts) >= 3 and _is_our_device(parts[2]):
+            ids.add(parts[2])
+    return sorted(ids)
+
+
+def _scan_our_device_topics(client: MQTTClient, our_device_ids: list[str], timeout: float) -> list[str]:
+    """
+    Every non-empty retained topic published under the given device ids, without duplicates.
+    """
+    wildcards = [f"/devices/{device_id}/#" for device_id in our_device_ids]
+    return list(dict.fromkeys(_scan_retained(client, wildcards, timeout)))
+
+
+def clear_all(client: MQTTClient, timeout: float = _SCAN_TIMEOUT) -> list[str]:
     """
     Remove the integration device and every key device from the broker.
 
-    Discovers our device/control ids from the broker (not from config), so it also
-    cleans up devices left by a previous, larger configuration. The id filter is strict
-    to our namespace, so foreign devices are never touched. Used on startup and uninstall.
+    Ids come from the broker, not from the config, so a key dropped from the config goes too and
+    foreign devices are never touched. Stuck retained commands go as well, safe only because the
+    caller wipes before it subscribes. A device's own meta is emptied last, so an interrupted run
+    leaves the device discoverable for the next one.
     """
-    topics = _scan_retained(client, ["/devices/+/meta", "/devices/+/controls/+/meta"], settle)
-    controls: dict[str, set[str]] = {}  # device id -> control ids
-    ids = {DEVICE_ID}
-    for topic in topics:
-        parts = topic.split("/")  # ['', 'devices', <id>, ...]
-        if len(parts) < 3:
-            continue
-        device_id = parts[2]
-        if not _is_our_device(device_id):
-            continue
-        ids.add(device_id)
-        if len(parts) >= 6 and parts[3] == "controls" and parts[5] == "meta":
-            controls.setdefault(device_id, set()).add(parts[4])
-
-    publish_results: list[Any] = []
-    for device_id in ids:
-        base = f"/devices/{device_id}"
-        for control_id in controls.get(device_id, ()):
-            publish_results.extend(_remove_control(client, base, control_id))
-        publish_results.append(_publish(client, f"{base}/meta", ""))
-    return publish_results
+    our_device_ids = _discover_our_device_ids(client, timeout)
+    our_device_meta_topics = {f"/devices/{device_id}/meta" for device_id in our_device_ids}
+    our_device_topics = _scan_our_device_topics(client, our_device_ids, timeout)
+    other_topics = [topic for topic in our_device_topics if topic not in our_device_meta_topics]
+    wiped_topics = other_topics + sorted(our_device_meta_topics)
+    for topic in wiped_topics:
+        _publish(client, topic, "")
+    return wiped_topics
 
 
-class KeyDevice:
+class PerKeyDevice:
     """
     One WB device per Waterius key: read-only mirrors of its channels plus its send status.
     """
@@ -230,8 +265,8 @@ class KeyDevice:
     def __init__(self, client: MQTTClient, index: int, device: Device, last_sent: str = "") -> None:
         self._client = client
         self._config_device = device
-        self._base = f"/devices/{key_device_id(index)}"
-        self._channels: list[tuple[str, dict]] = []
+        self._base = f"/devices/{build_key_device_id(index)}"
+        self._channels: list[Control] = []
         self._control_ids_by_source_topic: dict[str, list[str]] = {}
         # Restored from persistent state, kept current so a reconnect republishes it.
         self._last_sent = last_sent
@@ -260,20 +295,20 @@ class KeyDevice:
             if units:
                 meta["units"] = units
             control_id = f"ch{channel_index}"
-            self._channels.append((control_id, meta))
+            self._channels.append(Control(control_id, meta))
             self._control_ids_by_source_topic.setdefault(channel.mqtt_topic, []).append(control_id)
 
     def publish_meta(self) -> None:
         device_meta = {"driver": DRIVER, "title": self._title()}
         _publish(self._client, f"{self._base}/meta", json.dumps(device_meta))
-        for control_id, meta in self._channels:
-            _publish(self._client, f"{self._base}/controls/{control_id}/meta", json.dumps(meta))
-            _publish(self._client, f"{self._base}/controls/{control_id}", "")
-        for name, meta in (KEY_LAST_SENT, KEY_LAST_ERROR):
-            _publish(self._client, f"{self._base}/controls/{name}/meta", json.dumps(meta))
+        for control in self._channels:
+            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
+            _publish(self._client, f"{self._base}/controls/{control.id}", "")
+        for control in (KEY_LAST_SENT, KEY_LAST_ERROR):
+            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
         # Restore the persisted "Last Sent". "Last Error" starts empty.
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT[0]}", self._last_sent)
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR[0]}", "")
+        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", self._last_sent)
+        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
         self._set_error(False)
 
     def update_channel(self, mqtt_topic: str, raw_value: Optional[str]) -> None:
@@ -290,10 +325,6 @@ class KeyDevice:
         for control_id in control_ids:
             _publish(self._client, f"{self._base}/controls/{control_id}", value)
 
-    def set_last_sent(self, text: str) -> None:
-        self._last_sent = text
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT[0]}", text)
-
     def _set_error(self, on: bool) -> None:
         """
         Toggle the WB error flag on the Last Error control, shown red in the UI.
@@ -301,21 +332,26 @@ class KeyDevice:
         The flag is per-control in WB, and a failed send does not make the channel data
         wrong, so only this control carries it.
         """
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR[0]}/meta/error", "r" if on else "")
+        _publish(
+            self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}/meta/error", _ERROR_FLAG if on else ""
+        )
 
     def mark_sent(self, timestamp: str) -> None:
         """
         A successful send for this device: stamp Last Sent, clear the error.
+
+        The stamp is kept in the instance too, so a reconnect republishes it.
         """
-        self.set_last_sent(timestamp)
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR[0]}", "")
+        self._last_sent = timestamp
+        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", timestamp)
+        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
         self._set_error(False)
 
     def mark_failed(self, detail: str) -> None:
         """
         A failed send (API error or unavailable channels): show detail on Last Error.
         """
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR[0]}", detail)
+        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", detail)
         self._set_error(True)
 
 
@@ -334,16 +370,20 @@ class IntegrationDevice:
     def publish_meta(self) -> None:
         title = {"en": "Waterius Integration", "ru": "Интеграция с Ватериус"}
         device_meta = {"driver": DRIVER, "title": title}
-        _publish(self._client, f"{DEVICE_BASE}/meta", json.dumps(device_meta))
-        for name, meta in STATUS_CONTROLS:
-            _publish(self._client, f"{DEVICE_BASE}/controls/{name}/meta", json.dumps(meta))
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/meta", json.dumps(device_meta))
+        for control in STATUS_CONTROLS:
+            _publish(
+                self._client,
+                f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}/meta",
+                json.dumps(control.meta),
+            )
         # Startup state. The service applies the resting state once it is ready.
         self.set_state(STATE_INITIALIZING)
         self.set_error(False)
-        _publish(self._client, f"{DEVICE_BASE}/controls/version", self._version)
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_VERSION.id}", self._version)
 
     def subscribe(self) -> None:
-        enabled_topic = f"{DEVICE_BASE}/controls/enabled/on"
+        enabled_topic = f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}/on"
         self._client.subscribe(enabled_topic)
         self._client.message_callback_add(enabled_topic, self._on_enabled)
 
@@ -356,24 +396,26 @@ class IntegrationDevice:
         """
         Publish a numeric state code (see STATE_ENUM). The UI shows its label.
         """
-        _publish(self._client, f"{DEVICE_BASE}/controls/state", str(state))
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}", str(state))
 
     def set_enabled(self, on: bool) -> None:
-        _publish(self._client, f"{DEVICE_BASE}/controls/enabled", "1" if on else "0")
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}", "1" if on else "0")
 
     def set_current_time(self, text: str) -> None:
-        _publish(self._client, f"{DEVICE_BASE}/controls/current_time", text)
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_CURRENT_TIME.id}", text)
 
     def set_next_run(self, text: str) -> None:
-        _publish(self._client, f"{DEVICE_BASE}/controls/next_execution", text)
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_NEXT_EXECUTION.id}", text)
 
-    def set_error(self, on: bool) -> Any:
+    def set_error(self, on: bool) -> None:
         """
         Toggle the WB error flag on the state control (non-empty = red in the UI).
-
-        Returns the publish result, so a caller shutting down can wait for delivery.
         """
-        return _publish(self._client, f"{DEVICE_BASE}/controls/state/meta/error", "r" if on else "")
+        _publish(
+            self._client,
+            f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}/meta/error",
+            _ERROR_FLAG if on else "",
+        )
 
 
 class WateriusDevices:
@@ -392,11 +434,11 @@ class WateriusDevices:
     ) -> None:
         self._client = client
         self._integration_device = IntegrationDevice(client, on_toggle, version)
-        self._key_devices: list[KeyDevice] = []
+        self._key_devices: list[PerKeyDevice] = []
         if config is not None:
             restore = last_sent or []
             self._key_devices = [
-                KeyDevice(client, index + 1, device, restore[index] if index < len(restore) else "")
+                PerKeyDevice(client, index + 1, device, restore[index] if index < len(restore) else "")
                 for index, device in enumerate(config.devices)
             ]
 
@@ -438,8 +480,8 @@ class WateriusDevices:
         if 0 <= index < len(self._key_devices):
             self._key_devices[index].mark_failed(detail)
 
-    def clear(self, settle: float = 0.5) -> list[Any]:
+    def clear(self, timeout: float = _SCAN_TIMEOUT) -> list[str]:
         """
         Wipe every retained waterius device from the broker (clean-slate init).
         """
-        return clear_all(self._client, settle)
+        return clear_all(self._client, timeout)

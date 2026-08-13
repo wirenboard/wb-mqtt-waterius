@@ -1,29 +1,18 @@
 import json
+import time
 from collections.abc import Callable
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 
-from tests.conftest import ALL_DAYS, FakeClient
+from tests.conftest import ALL_DAYS, FakeClient, Message, topic_matches
 from wb.mqtt_waterius import mqtt_device
 from wb.mqtt_waterius.config import Channel, Config, Device
 
-INTEGRATION = "/devices/wb-mqtt-waterius"
-KEY_DEVICE1 = "/devices/wb-mqtt-waterius_1"
-KEY_DEVICE2 = "/devices/wb-mqtt-waterius_2"
-
-
-class _Msg:  # pylint: disable=too-few-public-methods
-    def __init__(self, payload: str, topic: str = "") -> None:
-        self.payload = payload.encode()
-        self.topic = topic
-
-
-def _matches(wildcard: str, topic: str) -> bool:
-    wildcard_parts, topic_parts = wildcard.split("/"), topic.split("/")
-    return len(wildcard_parts) == len(topic_parts) and all(
-        part in ("+", topic_part) for part, topic_part in zip(wildcard_parts, topic_parts)
-    )
+SCAN_MARKER_TOPIC = "/wb_mqtt_waterius/scan"
+INTEGRATION_BASE = mqtt_device.INTEGRATION_DEVICE_BASE
+KEY_DEVICE1_BASE = f"/devices/{mqtt_device.build_key_device_id(1)}"
+KEY_DEVICE2_BASE = f"/devices/{mqtt_device.build_key_device_id(2)}"
 
 
 class _DeliveringClient(FakeClient):  # pylint: disable=too-few-public-methods
@@ -41,8 +30,19 @@ class _DeliveringClient(FakeClient):  # pylint: disable=too-few-public-methods
         if callback is None:
             return
         for retained_topic, payload in self._retained.items():
-            if _matches(topic, retained_topic):
-                callback(self, None, _Msg(payload, retained_topic))
+            if topic_matches(topic, retained_topic):
+                callback(self, None, Message(payload, retained_topic))
+
+
+class _StaleMarkerClient(_DeliveringClient):  # pylint: disable=too-few-public-methods
+    """
+    Delivering client that answers the scan marker with the token of another scan.
+    """
+
+    def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
+        if topic == SCAN_MARKER_TOPIC:
+            payload = b"other-scan"
+        super().publish(topic, payload, retain, qos)
 
 
 def _devices(
@@ -62,32 +62,32 @@ def _single_config() -> Config:
 def test_integration_meta_title_and_version() -> None:
     client = FakeClient()
     _devices(client, _single_config()).publish_meta()
-    meta = json.loads(client.last(f"{INTEGRATION}/meta"))
+    meta = json.loads(client.last(f"{INTEGRATION_BASE}/meta"))
     assert meta["driver"] == "wb-mqtt-waterius"
     assert meta["title"] == {"en": "Waterius Integration", "ru": "Интеграция с Ватериус"}
-    assert client.last(f"{INTEGRATION}/controls/version") == "1.0.0"
+    assert client.last(f"{INTEGRATION_BASE}/controls/version") == "1.0.0"
 
 
 def test_integration_error_flag_toggle() -> None:
     client = FakeClient()
     devices = _devices(client, _single_config())
     devices.set_integration_error(True)
-    assert client.last(f"{INTEGRATION}/controls/state/meta/error") == "r"
+    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == "w"
     devices.set_state(mqtt_device.STATE_HAS_ERRORS)
-    assert client.last(f"{INTEGRATION}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
+    assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
     devices.set_integration_error(False)
-    assert client.last(f"{INTEGRATION}/controls/state/meta/error") == ""
+    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
 
 
 def test_set_enabled_and_state_setters() -> None:
     client = FakeClient()
     devices = _devices(client, _single_config())
     devices.set_enabled(False)
-    assert client.last(f"{INTEGRATION}/controls/enabled") == "0"
+    assert client.last(f"{INTEGRATION_BASE}/controls/enabled") == "0"
     devices.set_enabled(True)
-    assert client.last(f"{INTEGRATION}/controls/enabled") == "1"
+    assert client.last(f"{INTEGRATION_BASE}/controls/enabled") == "1"
     devices.set_state(mqtt_device.STATE_DISABLED)
-    assert client.last(f"{INTEGRATION}/controls/state") == str(mqtt_device.STATE_DISABLED)
+    assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_DISABLED)
 
 
 def test_time_controls_publish() -> None:
@@ -95,8 +95,8 @@ def test_time_controls_publish() -> None:
     devices = _devices(client, _single_config())
     devices.set_current_time("Thursday 2026-07-16 18:37")
     devices.set_next_run("Friday 2026-07-17 12:00")
-    assert client.last(f"{INTEGRATION}/controls/current_time") == "Thursday 2026-07-16 18:37"
-    assert client.last(f"{INTEGRATION}/controls/next_execution") == "Friday 2026-07-17 12:00"
+    assert client.last(f"{INTEGRATION_BASE}/controls/current_time") == "Thursday 2026-07-16 18:37"
+    assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Friday 2026-07-17 12:00"
 
 
 def test_enable_toggle_callback_fires() -> None:
@@ -104,9 +104,9 @@ def test_enable_toggle_callback_fires() -> None:
     toggled = []
     devices = _devices(client, _single_config(), on_toggle=toggled.append)
     devices.subscribe()
-    on_enabled = client.callbacks[f"{INTEGRATION}/controls/enabled/on"]
-    on_enabled(None, None, _Msg("0"))
-    on_enabled(None, None, _Msg("1"))
+    on_enabled = client.callbacks[f"{INTEGRATION_BASE}/controls/enabled/on"]
+    on_enabled(None, None, Message("0"))
+    on_enabled(None, None, Message("1"))
     assert toggled == [False, True]
 
 
@@ -115,14 +115,13 @@ def test_mark_device_sent_stamps_and_clears() -> None:
     devices = _devices(client, _single_config())
     devices.mark_device_failed(0, "HTTP 500")  # fail first, so there is an error to clear
     devices.mark_device_sent(0, "2026-01-01 03:00:00")
-    assert client.last(f"{KEY_DEVICE1}/controls/last_sent") == "2026-01-01 03:00:00"
-    assert client.last(f"{KEY_DEVICE1}/controls/last_error") == ""
-    assert client.last(f"{KEY_DEVICE1}/controls/last_error/meta/error") == ""
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") == "2026-01-01 03:00:00"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == ""
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == ""
 
 
 def test_last_sent_is_restored_per_key_device() -> None:
-    # The persisted stamps come back on startup so a restart does not blank "Last Sent".
-    # A key added since the last send has no stamp yet, and its control stays empty.
+    # A key added since the last send has no stamp yet, so its control stays empty.
     config = Config(
         "03:00",
         [Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 0)])],
@@ -133,35 +132,35 @@ def test_last_sent_is_restored_per_key_device() -> None:
         client, config=config, version="1.0.0", last_sent=["2026-01-01 03:00:00"]
     )
     devices.publish_meta()
-    assert client.last(f"{KEY_DEVICE1}/controls/last_sent") == "2026-01-01 03:00:00"
-    assert client.last(f"{KEY_DEVICE2}/controls/last_sent") == ""
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") == "2026-01-01 03:00:00"
+    assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_sent") == ""
 
 
 def test_failed_send_flags_only_last_error() -> None:
     client = FakeClient()
     devices = _devices(client, _single_config())
     devices.mark_device_failed(0, "No data from channels: dev/cold")
-    assert client.last(f"{KEY_DEVICE1}/controls/last_error") == "No data from channels: dev/cold"
-    assert client.last(f"{KEY_DEVICE1}/controls/last_error/meta/error") == "r"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == "No data from channels: dev/cold"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == "w"
     # channels and last_sent carry no error flag — the send failed, the data isn't wrong
     for control in ("ch0", "ch1", "last_sent"):
-        assert client.last(f"{KEY_DEVICE1}/controls/{control}/meta/error") in (None, "")
+        assert client.last(f"{KEY_DEVICE1_BASE}/controls/{control}/meta/error") in (None, "")
 
 
 def test_key_device_title_masks_key() -> None:
-    # A real 32-char key: the title carries only its masked prefix, never the full credential.
+    # A full-length key, so masking runs on the same input length as in production.
     config = Config(
         "03:00", [Device("01234567890123456789012345678901", [Channel("dev/cold", 0)])], days_of_week=ALL_DAYS
     )
     client = FakeClient()
     _devices(client, config).publish_meta()
-    meta = json.loads(client.last(f"{KEY_DEVICE1}/meta"))
+    meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
     assert meta["title"] == {"en": "Waterius - 01234", "ru": "Ватериус - 01234"}
 
 
 def test_key_device_title_prefers_device_name() -> None:
-    # A configured name replaces the masked key, and the "Waterius - " prefix stays so our
-    # devices remain recognizable in the flat device list.
+    # The "Waterius - " prefix survives a configured name, so our devices stay recognizable
+    # in the flat device list.
     config = Config(
         "03:00",
         [Device("01234567890123456789012345678901", [Channel("dev/cold", 0)], name="Котельная")],
@@ -169,12 +168,11 @@ def test_key_device_title_prefers_device_name() -> None:
     )
     client = FakeClient()
     _devices(client, config).publish_meta()
-    meta = json.loads(client.last(f"{KEY_DEVICE1}/meta"))
+    meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
     assert meta["title"] == {"en": "Waterius - Котельная", "ru": "Ватериус - Котельная"}
 
 
 def test_each_key_becomes_its_own_device() -> None:
-    # Two config entries become two devices, and each device gets the channel of its own entry.
     config = Config(
         "03:00",
         [Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 2)])],
@@ -182,10 +180,10 @@ def test_each_key_becomes_its_own_device() -> None:
     )
     client = FakeClient()
     _devices(client, config).publish_meta()
-    assert client.last(f"{KEY_DEVICE1}/meta") is not None
-    assert client.last(f"{KEY_DEVICE2}/meta") is not None
-    first = json.loads(client.last(f"{KEY_DEVICE1}/controls/ch0/meta"))
-    second = json.loads(client.last(f"{KEY_DEVICE2}/controls/ch0/meta"))
+    assert client.last(f"{KEY_DEVICE1_BASE}/meta") is not None
+    assert client.last(f"{KEY_DEVICE2_BASE}/meta") is not None
+    first = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
+    second = json.loads(client.last(f"{KEY_DEVICE2_BASE}/controls/ch0/meta"))
     assert first["title"]["en"] == "Cold Water"
     assert second["title"]["en"] == "Electricity"
 
@@ -209,7 +207,7 @@ def test_key_device_channel_units_by_type(data_type: int, units: str) -> None:
     config = Config("03:00", [Device("K1", [Channel("dev/c", data_type)])], days_of_week=ALL_DAYS)
     client = FakeClient()
     _devices(client, config).publish_meta()
-    meta = json.loads(client.last(f"{KEY_DEVICE1}/controls/ch0/meta"))
+    meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
     assert meta["type"] == "value"
     assert meta["units"] == units
 
@@ -220,8 +218,8 @@ def test_duplicate_type_within_key_gets_source_suffix() -> None:
     )
     client = FakeClient()
     _devices(client, config).publish_meta()
-    first = json.loads(client.last(f"{KEY_DEVICE1}/controls/ch0/meta"))
-    second = json.loads(client.last(f"{KEY_DEVICE1}/controls/ch1/meta"))
+    first = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
+    second = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch1/meta"))
     assert first["title"]["en"] == "Cold Water (cold1)"
     assert second["title"]["en"] == "Cold Water (cold2)"
 
@@ -235,8 +233,8 @@ def test_update_channel_routes_to_owning_key_device() -> None:
     client = FakeClient()
     devices = _devices(client, config)
     devices.update_channel("/devices/d2/controls/cold", "84.20")
-    assert client.last(f"{KEY_DEVICE2}/controls/ch0") == "84.20"
-    assert client.last(f"{KEY_DEVICE1}/controls/ch0") is None
+    assert client.last(f"{KEY_DEVICE2_BASE}/controls/ch0") == "84.20"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") is None
 
 
 def test_update_channel_ignores_unconfigured_topic() -> None:
@@ -246,46 +244,87 @@ def test_update_channel_ignores_unconfigured_topic() -> None:
     devices = _devices(client, _single_config())
     devices.update_channel("/devices/other/controls/x", "5")
     for topic, *_ in client.published:
-        assert not topic.startswith(f"{KEY_DEVICE1}/controls/ch")
+        assert not topic.startswith(f"{KEY_DEVICE1_BASE}/controls/ch")
 
 
-def test_clear_all_clears_control_meta_value_and_error() -> None:
-    # Removing a control takes three publishes: meta, value and the error flag. A leftover
-    # meta would keep the control in the UI, a leftover error flag would keep it red.
-    control = f"{KEY_DEVICE1}/controls/ch0"
-    client = _DeliveringClient({f"{control}/meta": '{"type": "value"}'})
-    mqtt_device.clear_all(client, settle=0.2)
-    for topic in (f"{control}/meta", control, f"{control}/meta/error"):
+def test_clear_all_wipes_whatever_the_broker_holds() -> None:
+    # A device in our namespace can be published by someone else — a wb-rules virtual device
+    # spreads its meta over subtopics — so the wipe takes what the broker holds.
+    control = f"{KEY_DEVICE1_BASE}/controls/ch0"
+    retained = {
+        f"{KEY_DEVICE1_BASE}/meta/name": "Waterius - K1",
+        f"{control}/meta/type": "value",
+        f"{control}/meta/order": "2",
+        control: "42.5",
+    }
+    client = _DeliveringClient(retained)
+    mqtt_device.clear_all(client)
+    for topic in retained:
         assert client.last(topic) == ""
+
+
+def test_clear_all_wipes_a_stuck_retained_command() -> None:
+    # A retained command comes back on every subscribe and would force the switch.
+    command = f"{INTEGRATION_BASE}/controls/enabled/on"
+    client = _DeliveringClient({f"{INTEGRATION_BASE}/meta": "{}", command: "1"})
+    mqtt_device.clear_all(client)
+    assert client.last(command) == ""
+
+
+def test_clear_all_empties_device_meta_after_its_controls() -> None:
+    # An interrupted run leaves the device discoverable, so the next scan finds it again.
+    control_meta = f"{KEY_DEVICE1_BASE}/controls/ch0/meta"
+    client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}", control_meta: '{"type": "value"}'})
+    mqtt_device.clear_all(client)
+    published = [topic for topic, *_ in client.published]
+    assert published.index(control_meta) < published.index(f"{KEY_DEVICE1_BASE}/meta")
 
 
 def test_clear_all_publishes_empty_integration_meta() -> None:
     client = FakeClient()
-    publish_results = mqtt_device.clear_all(client, settle=0)
-    assert (f"{INTEGRATION}/meta", "", True, 1) in client.published
-    assert publish_results
+    wiped_topics = mqtt_device.clear_all(client)
+    assert (f"{INTEGRATION_BASE}/meta", "", True, 1) in client.published
+    assert wiped_topics == [f"{INTEGRATION_BASE}/meta"]
 
 
 def test_clear_all_wipes_our_leftovers_and_spares_foreign_devices() -> None:
-    # Ids come from the broker, not from the config, so a leftover gets wiped too: the user had
-    # five keys, device _5 is still retained in the broker, and the shortened config would never
-    # mention it again. An already removed control comes with an empty payload and is skipped,
-    # a device outside our namespace is never touched.
+    # Ids come from the broker, not from the config, so a key the user has already deleted from
+    # the config still gets wiped. An empty payload means the control is gone and is skipped.
+    our_device_meta = json.dumps({"driver": mqtt_device.DRIVER})
+    dropped_key_base = f"/devices/{mqtt_device.build_key_device_id(5)}"
+    foreign_base = "/devices/wb-mqtt-serial"
     client = _DeliveringClient(
         {
-            f"{INTEGRATION}/meta": '{"driver": "wb-mqtt-waterius"}',
-            "/devices/wb-mqtt-waterius_5/meta": '{"driver": "wb-mqtt-waterius"}',
-            "/devices/wb-mqtt-waterius_5/controls/ch0/meta": '{"type": "value"}',
-            "/devices/wb-mqtt-waterius_5/controls/ch1/meta": "",
-            "/devices/wb-mqtt-serial/meta": '{"driver": "wb-mqtt-serial"}',
-            "/devices/wb-mqtt-serial/controls/temp/meta": '{"type": "value"}',
+            f"{INTEGRATION_BASE}/meta": our_device_meta,
+            f"{dropped_key_base}/meta": our_device_meta,
+            f"{dropped_key_base}/controls/ch0/meta": '{"type": "value"}',
+            f"{dropped_key_base}/controls/ch1/meta": "",
+            f"{foreign_base}/meta": '{"driver": "wb-mqtt-serial"}',
+            f"{foreign_base}/controls/temp/meta": '{"type": "value"}',
         }
     )
-    mqtt_device.clear_all(client, settle=0.2)
+    mqtt_device.clear_all(client)
     published = [topic for topic, *_ in client.published]
-    assert f"{INTEGRATION}/meta" in published
-    assert "/devices/wb-mqtt-waterius_5/meta" in published
-    assert "/devices/wb-mqtt-waterius_5/controls/ch0/meta" in published
-    assert "/devices/wb-mqtt-waterius_5/controls/ch1/meta" not in published
-    assert "/devices/wb-mqtt-serial/meta" not in published
-    assert "/devices/wb-mqtt-serial/controls/temp/meta" not in published
+    assert f"{INTEGRATION_BASE}/meta" in published
+    assert f"{dropped_key_base}/meta" in published
+    assert f"{dropped_key_base}/controls/ch0/meta" in published
+    assert f"{dropped_key_base}/controls/ch1/meta" not in published
+    assert f"{foreign_base}/meta" not in published
+    assert f"{foreign_base}/controls/temp/meta" not in published
+
+
+def test_scan_ends_on_its_own_marker_and_not_on_the_timeout() -> None:
+    client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
+    started = time.monotonic()
+    mqtt_device.clear_all(client, timeout=30)
+    assert time.monotonic() - started < 1
+    assert SCAN_MARKER_TOPIC in [topic for topic, *_ in client.published]
+
+
+def test_scan_falls_back_to_the_timeout_when_the_marker_is_not_ours() -> None:
+    # A marker left over from a scan that hit its timeout must not end the next one.
+    client = _StaleMarkerClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
+    started = time.monotonic()
+    wiped_topics = mqtt_device.clear_all(client, timeout=0.05)
+    assert time.monotonic() - started >= 0.1  # both scans waited their guard out
+    assert f"{KEY_DEVICE1_BASE}/meta" in wiped_topics
