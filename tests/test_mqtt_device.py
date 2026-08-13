@@ -20,18 +20,20 @@ class _DeliveringClient(FakeClient):  # pylint: disable=too-few-public-methods
     FakeClient that answers a subscription with retained messages, the way a broker does.
     """
 
-    def __init__(self, retained: dict) -> None:
+    def __init__(self, retained: dict[str, str]) -> None:
         super().__init__()
         self._retained = retained
 
     def subscribe(self, topic: str) -> None:
         super().subscribe(topic)
-        callback = self.callbacks.get(topic)
-        if callback is None:
+        if topic not in self.callbacks:
             return
         for retained_topic, payload in self._retained.items():
-            if topic_matches(topic, retained_topic):
-                callback(self, None, Message(payload, retained_topic))
+            if not topic_matches(topic, retained_topic):
+                continue
+            for wildcard, callback in list(self.callbacks.items()):
+                if topic_matches(wildcard, retained_topic):
+                    callback(self, None, Message(payload, retained_topic))
 
 
 class _StaleMarkerClient(_DeliveringClient):  # pylint: disable=too-few-public-methods
@@ -237,6 +239,23 @@ def test_update_channel_routes_to_owning_key_device() -> None:
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") is None
 
 
+def test_update_channel_mirrors_one_source_onto_every_channel_that_uses_it() -> None:
+    # One control can feed several channels — the config allows the same mqttTopicName twice,
+    # deliberately — and every mirror has to move, not just the first.
+    source = "dev/cold"
+    config = Config(
+        "03:00",
+        [Device("K1", [Channel(source, 0), Channel(source, 1)]), Device("K2", [Channel(source, 0)])],
+        days_of_week=ALL_DAYS,
+    )
+    client = FakeClient()
+    devices = _devices(client, config)
+    devices.update_channel(f"/devices/{source.replace('/', '/controls/')}", "42.5")
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") == "42.5"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch1") == "42.5"
+    assert client.last(f"{KEY_DEVICE2_BASE}/controls/ch0") == "42.5"
+
+
 def test_update_channel_ignores_unconfigured_topic() -> None:
     # The service hands every message it receives to the facade, and a topic can outlive its
     # channel — a config edit removes it while the broker still delivers the old retained value.
@@ -311,6 +330,57 @@ def test_clear_all_wipes_our_leftovers_and_spares_foreign_devices() -> None:
     assert f"{dropped_key_base}/controls/ch1/meta" not in published
     assert f"{foreign_base}/meta" not in published
     assert f"{foreign_base}/controls/temp/meta" not in published
+
+
+def test_clear_through_the_facade_cannot_toggle_the_switch() -> None:
+    # The wipe scans our own devices, so the broker re-delivers a stuck retained command to
+    # whatever still listens on it. Without dropping the subscription first, that flips
+    # automatic sending behind the user's back — reproduced on the stand before the fix.
+    command = f"{INTEGRATION_BASE}/controls/enabled/on"
+    client = _DeliveringClient({f"{INTEGRATION_BASE}/meta": "{}", command: "0"})
+    toggled: list[bool] = []
+    devices = _devices(client, _single_config(), on_toggle=toggled.append)
+    devices.subscribe()
+    devices.clear()
+    assert not toggled
+    assert client.last(command) == ""  # and the command itself is gone
+
+
+def test_clear_through_the_facade_wipes_the_same_topics() -> None:
+    client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
+    assert set(_devices(client, _single_config()).clear()) == {
+        f"{KEY_DEVICE1_BASE}/meta",
+        f"{INTEGRATION_BASE}/meta",
+    }
+
+
+def test_mark_device_out_of_range_is_a_no_op() -> None:
+    # Indices come from enumerating the config, so a mismatch must not raise on the paho thread.
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.mark_device_sent(5, "2026-01-01 03:00:00")
+    devices.mark_device_failed(-1, "HTTP 500")
+    assert [topic for topic, *_ in client.published] == []
+
+
+def test_no_configured_devices_publishes_the_integration_device_only() -> None:
+    # The fresh-install state: no keys yet, the daemon idles instead of crash-looping.
+    client = FakeClient()
+    _devices(client, Config("03:00", [], days_of_week=ALL_DAYS)).publish_meta()
+    assert client.last(f"{INTEGRATION_BASE}/meta") is not None
+    assert not [topic for topic, *_ in client.published if topic.startswith(f"{INTEGRATION_BASE}_")]
+
+
+def test_integration_status_controls_carry_meta_and_a_startup_state() -> None:
+    client = FakeClient()
+    _devices(client, _single_config()).publish_meta()
+    state_meta = json.loads(client.last(f"{INTEGRATION_BASE}/controls/state/meta"))
+    assert state_meta["readonly"] is True
+    assert state_meta["enum"]["4"] == {"en": "Has Errors", "ru": "Есть ошибки"}
+    enabled_meta = json.loads(client.last(f"{INTEGRATION_BASE}/controls/enabled/meta"))
+    assert enabled_meta["type"] == "switch"
+    assert "readonly" not in enabled_meta  # the switch is the one control the user writes
+    assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_INITIALIZING)
 
 
 def test_wait_for_broker_confirms_when_its_token_returns() -> None:

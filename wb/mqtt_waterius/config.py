@@ -5,7 +5,7 @@ Load and validate /etc/wb-mqtt-waterius.conf.
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 from wb.mqtt_waterius.waterius_api import mask_key
@@ -82,7 +82,7 @@ class Channel:
         return f"/devices/{self.device}/controls/{self.control}"
 
 
-@dataclass
+@dataclass(eq=False)
 class Device:
     """
     One Waterius key, its display name, and its up-to-four channels.
@@ -90,7 +90,8 @@ class Device:
     An empty name leaves the name set in the Waterius cabinet as it is.
     """
 
-    key: str
+    # The key is a write credential, so it stays out of the generated repr.
+    key: str = field(repr=False)
     channels: list[Channel]
     name: str = ""
 

@@ -6,10 +6,10 @@ Topology:
 * an integration device ``/devices/wb_mqtt_waterius`` — the automatic-sending switch plus
   read-only status (state, version, current time, next send).
 * one device per key ``/devices/wb_mqtt_waterius_<N>`` (1-based) — typed read-only
-  channel mirrors plus per-device "Last Sent" and "Last Error". Titled by the configured
+  channel mirrors plus per-device "Last Sent" and "Errors". Titled by the configured
   device name, or by a masked key prefix when there is none.
 
-A failed send fills the "Last Error" control of the affected key device and raises the WB error
+A failed send fills the "Errors" control of the affected key device and raises the WB error
 flag on it, which the UI shows in red. The integration device aggregates to the "Has Errors"
 state.
 """
@@ -47,7 +47,7 @@ _MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 
 # Guard for a broker that answers nothing. It bounds the whole retained burst, not just its
 # first message, so it has room for a large installation.
-_SCAN_TIMEOUT = 5.0
+DEFAULT_SCAN_TIMEOUT = 5.0
 
 
 # data_type code -> (WB control type, units, bilingual title). All meters use the generic
@@ -135,7 +135,7 @@ STATUS_NEXT_EXECUTION = Control(
 STATUS_CONTROLS = [STATUS_ENABLED, STATUS_STATE, STATUS_VERSION, STATUS_CURRENT_TIME, STATUS_NEXT_EXECUTION]
 
 # Per-device controls: "Last Sent" on top (order 1), channels in between (order 2..),
-# "Last Error" at the bottom (order 100).
+# "Errors" at the bottom (order 100).
 KEY_LAST_SENT = Control(
     "last_sent",
     {"type": "text", "readonly": True, "order": 1, "title": {"en": "Last Sent", "ru": "Отправлено"}},
@@ -178,7 +178,7 @@ def _publish(client: MQTTClient, topic: str, value: str) -> None:
     client.publish(topic, value, retain=True, qos=1)
 
 
-def wait_for_broker(client: MQTTClient, timeout: float = _SCAN_TIMEOUT) -> bool:
+def wait_for_broker(client: MQTTClient, timeout: float = DEFAULT_SCAN_TIMEOUT) -> bool:
     """
     Block until the broker has handled everything published before this call.
 
@@ -205,7 +205,9 @@ def wait_for_broker(client: MQTTClient, timeout: float = _SCAN_TIMEOUT) -> bool:
     return confirmed
 
 
-def _scan_retained(client: MQTTClient, wildcards: list[str], timeout: float = _SCAN_TIMEOUT) -> list[str]:
+def _scan_retained(
+    client: MQTTClient, wildcards: list[str], timeout: float = DEFAULT_SCAN_TIMEOUT
+) -> list[str]:
     """
     Collect every non-empty retained topic matching the wildcards.
 
@@ -252,14 +254,17 @@ def _scan_our_device_topics(client: MQTTClient, our_device_ids: list[str], timeo
     return list(dict.fromkeys(_scan_retained(client, wildcards, timeout)))
 
 
-def clear_all(client: MQTTClient, timeout: float = _SCAN_TIMEOUT) -> list[str]:
+def clear_all(client: MQTTClient, timeout: float = DEFAULT_SCAN_TIMEOUT) -> list[str]:
     """
     Remove the integration device and every key device from the broker.
 
     Ids come from the broker, not from the config, so a key dropped from the config goes too and
     foreign devices are never touched. Stuck retained commands go as well, safe only because the
-    caller wipes before it subscribes. A device's own meta is emptied last, so an interrupted run
-    leaves the device discoverable for the next one.
+    caller drops the switch subscription first, which ``WateriusDevices.clear`` does. A device's
+    own ``/meta`` is emptied last, so an interrupted run leaves the device discoverable by it.
+
+    Returns:
+        the topics emptied, a device's own ``/meta`` included even where the broker held none
     """
     our_device_ids = _discover_our_device_ids(client, timeout)
     our_device_meta_topics = {f"/devices/{device_id}/meta" for device_id in our_device_ids}
@@ -296,15 +301,13 @@ class PerKeyDevice:
         type_counts = Counter(channel.data_type for channel in self._config_device.channels)
         for channel_index, channel in enumerate(self._config_device.channels):
             wb_type, units, base = DATA_TYPE_CONTROLS.get(
-                int(channel.data_type),
+                channel.data_type,
                 ("value", "", {"en": f"Type {channel.data_type}", "ru": f"Тип {channel.data_type}"}),
             )
-            title = dict(base)
             # Disambiguate a repeated meter type by the short control name, not the full
             # topic: the UI cell truncates a long title on the tail that distinguishes it.
-            if type_counts[channel.data_type] > 1:
-                title["en"] += f" ({channel.control})"
-                title["ru"] += f" ({channel.control})"
+            suffix = f" ({channel.control})" if type_counts[channel.data_type] > 1 else ""
+            title = {lang: text + suffix for lang, text in base.items()}
             meta = {"type": wb_type, "readonly": True, "order": channel_index + 2, "title": title}
             if units:
                 meta["units"] = units
@@ -320,7 +323,7 @@ class PerKeyDevice:
             _publish(self._client, f"{self._base}/controls/{control.id}", "")
         for control in (KEY_LAST_SENT, KEY_LAST_ERROR):
             _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
-        # Restore the persisted "Last Sent". "Last Error" starts empty.
+        # Restore the persisted "Last Sent". "Errors" starts empty.
         _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", self._last_sent)
         _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
         self._set_error(False)
@@ -341,7 +344,7 @@ class PerKeyDevice:
 
     def _set_error(self, on: bool) -> None:
         """
-        Toggle the WB error flag on the Last Error control, shown red in the UI.
+        Toggle the WB error flag on the "Errors" control, shown red in the UI.
 
         The flag is per-control in WB, and a failed send does not make the channel data
         wrong, so only this control carries it.
@@ -363,7 +366,7 @@ class PerKeyDevice:
 
     def mark_failed(self, detail: str) -> None:
         """
-        A failed send (API error or unavailable channels): show detail on Last Error.
+        A failed send (API error or unavailable channels): show detail on "Errors".
         """
         _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", detail)
         self._set_error(True)
@@ -396,15 +399,31 @@ class IntegrationDevice:
         self.set_error(False)
         _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_VERSION.id}", self._version)
 
+    def _enabled_topic(self) -> str:
+        return f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}/on"
+
     def subscribe(self) -> None:
-        enabled_topic = f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}/on"
-        self._client.subscribe(enabled_topic)
-        self._client.message_callback_add(enabled_topic, self._on_enabled)
+        self._client.subscribe(self._enabled_topic())
+        self._client.message_callback_add(self._enabled_topic(), self._on_enabled)
+
+    def unsubscribe(self) -> None:
+        """
+        Drop the switch subscription and its callback, to be called before a wipe.
+
+        A scan of our own devices matches the command topic too, so the broker hands a stuck
+        retained command to a live callback and the switch flips behind the user's back. The
+        callback outlives a single setup, so wiping before subscribing is not enough on its own.
+        """
+        self._client.unsubscribe(self._enabled_topic())
+        self._client.message_callback_remove(self._enabled_topic())
 
     def _on_enabled(self, _client: MQTTClient, _userdata: Any, message: Any) -> None:
-        enabled = message.payload.decode(errors="replace").strip() == "1"
+        command = message.payload.decode(errors="replace").strip()
+        if not command:
+            # Emptying the topic is how a command is cleared, never how one is given.
+            return
         if self._on_toggle:
-            self._on_toggle(enabled)
+            self._on_toggle(command == "1")
 
     def set_state(self, state: int) -> None:
         """
@@ -435,6 +454,9 @@ class IntegrationDevice:
 class WateriusDevices:
     """
     Owns the integration device and one key device per entry in the config. The service's facade.
+
+    Restored "Last Sent" stamps line up with ``config.devices`` positionally. A shorter list is
+    allowed, the keys it does not reach start with an empty stamp.
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -494,8 +516,15 @@ class WateriusDevices:
         if 0 <= index < len(self._key_devices):
             self._key_devices[index].mark_failed(detail)
 
-    def clear(self, timeout: float = _SCAN_TIMEOUT) -> list[str]:
+    def clear(self, timeout: float = DEFAULT_SCAN_TIMEOUT) -> list[str]:
         """
         Wipe every retained waterius device from the broker (clean-slate init).
+
+        Drops the switch subscription first, so the wipe cannot feed a stuck retained command
+        back into the toggle, and must run before ``subscribe`` restores it.
+
+        Returns:
+            the topics emptied, device meta included even where the broker held none
         """
+        self._integration_device.unsubscribe()
         return clear_all(self._client, timeout)

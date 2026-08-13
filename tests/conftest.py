@@ -54,9 +54,9 @@ class FakeClient:
     """
 
     def __init__(self) -> None:
-        self.published = []
-        self.subscribed = []
-        self.callbacks = {}
+        self.published: list[tuple[str, Any, bool, int]] = []
+        self.subscribed: list[str] = []
+        self.callbacks: dict[str, Callable] = {}
         self.on_connect: Optional[Callable] = None
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
@@ -87,7 +87,7 @@ class FakeClient:
     def stop(self) -> None:
         pass
 
-    def last(self, topic: str) -> Optional[str]:
+    def last(self, topic: str) -> Any:
         for published_topic, payload, _, _ in reversed(self.published):
             if published_topic == topic:
                 return payload
