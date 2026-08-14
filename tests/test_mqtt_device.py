@@ -63,7 +63,7 @@ def _single_config() -> Config:
 
 def test_integration_meta_title_and_version() -> None:
     client = FakeClient()
-    _devices(client, _single_config()).publish_meta()
+    _devices(client, _single_config()).create()
     meta = json.loads(client.last(f"{INTEGRATION_BASE}/meta"))
     assert meta["driver"] == "wb-mqtt-waterius"
     assert meta["title"] == {"en": "Waterius Integration", "ru": "Интеграция с Ватериус"}
@@ -133,7 +133,7 @@ def test_last_sent_is_restored_per_key_device() -> None:
     devices = mqtt_device.WateriusDevices(
         client, config=config, version="1.0.0", last_sent=["2026-01-01 03:00:00"]
     )
-    devices.publish_meta()
+    devices.create()
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") == "2026-01-01 03:00:00"
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_sent") == ""
 
@@ -155,7 +155,7 @@ def test_key_device_title_masks_key() -> None:
         "03:00", [Device("01234567890123456789012345678901", [Channel("dev/cold", 0)])], days_of_week=ALL_DAYS
     )
     client = FakeClient()
-    _devices(client, config).publish_meta()
+    _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
     assert meta["title"] == {"en": "Waterius - 01234", "ru": "Ватериус - 01234"}
 
@@ -169,7 +169,7 @@ def test_key_device_title_prefers_device_name() -> None:
         days_of_week=ALL_DAYS,
     )
     client = FakeClient()
-    _devices(client, config).publish_meta()
+    _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
     assert meta["title"] == {"en": "Waterius - Котельная", "ru": "Ватериус - Котельная"}
 
@@ -181,7 +181,7 @@ def test_each_key_becomes_its_own_device() -> None:
         days_of_week=ALL_DAYS,
     )
     client = FakeClient()
-    _devices(client, config).publish_meta()
+    _devices(client, config).create()
     assert client.last(f"{KEY_DEVICE1_BASE}/meta") is not None
     assert client.last(f"{KEY_DEVICE2_BASE}/meta") is not None
     first = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
@@ -208,7 +208,7 @@ def test_each_key_becomes_its_own_device() -> None:
 def test_key_device_channel_units_by_type(data_type: int, units: str) -> None:
     config = Config("03:00", [Device("K1", [Channel("dev/c", data_type)])], days_of_week=ALL_DAYS)
     client = FakeClient()
-    _devices(client, config).publish_meta()
+    _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
     assert meta["type"] == "value"
     assert meta["units"] == units
@@ -219,7 +219,7 @@ def test_duplicate_type_within_key_gets_source_suffix() -> None:
         "03:00", [Device("K1", [Channel("dev/cold1", 0), Channel("dev/cold2", 0)])], days_of_week=ALL_DAYS
     )
     client = FakeClient()
-    _devices(client, config).publish_meta()
+    _devices(client, config).create()
     first = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
     second = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch1/meta"))
     assert first["title"]["en"] == "Cold Water (cold1)"
@@ -366,14 +366,14 @@ def test_mark_device_out_of_range_is_a_no_op() -> None:
 def test_no_configured_devices_publishes_the_integration_device_only() -> None:
     # The fresh-install state: no keys yet, the daemon idles instead of crash-looping.
     client = FakeClient()
-    _devices(client, Config("03:00", [], days_of_week=ALL_DAYS)).publish_meta()
+    _devices(client, Config("03:00", [], days_of_week=ALL_DAYS)).create()
     assert client.last(f"{INTEGRATION_BASE}/meta") is not None
     assert not [topic for topic, *_ in client.published if topic.startswith(f"{INTEGRATION_BASE}_")]
 
 
 def test_integration_status_controls_carry_meta_and_a_startup_state() -> None:
     client = FakeClient()
-    _devices(client, _single_config()).publish_meta()
+    _devices(client, _single_config()).create()
     state_meta = json.loads(client.last(f"{INTEGRATION_BASE}/controls/state/meta"))
     assert state_meta["readonly"] is True
     assert state_meta["enum"]["4"] == {"en": "Has Errors", "ru": "Есть ошибки"}
@@ -381,6 +381,9 @@ def test_integration_status_controls_carry_meta_and_a_startup_state() -> None:
     assert enabled_meta["type"] == "switch"
     assert "readonly" not in enabled_meta  # the switch is the one control the user writes
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_INITIALIZING)
+    assert client.last(f"{INTEGRATION_BASE}/controls/enabled") == "0"
+    assert client.last(f"{INTEGRATION_BASE}/controls/current_time") == mqtt_device.NO_TIME
+    assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == mqtt_device.NO_TIME
 
 
 def test_wait_for_broker_confirms_when_its_token_returns() -> None:

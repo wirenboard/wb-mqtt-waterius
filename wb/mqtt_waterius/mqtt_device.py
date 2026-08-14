@@ -49,6 +49,9 @@ _MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 # first message, so it has room for a large installation.
 DEFAULT_SCAN_TIMEOUT = 5.0
 
+# Placeholder for a time control with nothing to show yet
+NO_TIME = "--:--"
+
 
 # data_type code -> (WB control type, units, bilingual title). All meters use the generic
 # "value" type with an explicit unit. Titles follow Waterius's own cabinet naming.
@@ -315,14 +318,22 @@ class PerKeyDevice:
             self._channels.append(Control(control_id, meta))
             self._control_ids_by_source_topic.setdefault(channel.mqtt_topic, []).append(control_id)
 
-    def publish_meta(self) -> None:
+    def create(self) -> None:
+        """
+        Publish the device: meta for every control, then a starting value for each.
+        """
+        self._publish_meta()
+        self._publish_initial_values()
+
+    def _publish_meta(self) -> None:
         device_meta = {"driver": DRIVER, "title": self._title()}
         _publish(self._client, f"{self._base}/meta", json.dumps(device_meta))
+        for control in self._channels + [KEY_LAST_SENT, KEY_LAST_ERROR]:
+            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
+
+    def _publish_initial_values(self) -> None:
         for control in self._channels:
-            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
             _publish(self._client, f"{self._base}/controls/{control.id}", "")
-        for control in (KEY_LAST_SENT, KEY_LAST_ERROR):
-            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
         # Restore the persisted "Last Sent". "Errors" starts empty.
         _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", self._last_sent)
         _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
@@ -384,7 +395,14 @@ class IntegrationDevice:
         self._on_toggle = on_toggle
         self._version = version
 
-    def publish_meta(self) -> None:
+    def create(self) -> None:
+        """
+        Publish the device: meta for every control, then a starting value for each.
+        """
+        self._publish_meta()
+        self._publish_initial_values()
+
+    def _publish_meta(self) -> None:
         title = {"en": "Waterius Integration", "ru": "Интеграция с Ватериус"}
         device_meta = {"driver": DRIVER, "title": title}
         _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/meta", json.dumps(device_meta))
@@ -394,9 +412,13 @@ class IntegrationDevice:
                 f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}/meta",
                 json.dumps(control.meta),
             )
-        # Startup state. The service applies the resting state once it is ready.
+
+    def _publish_initial_values(self) -> None:
         self.set_state(STATE_INITIALIZING)
         self.set_error(False)
+        self.set_enabled(False)
+        self.set_current_time(NO_TIME)
+        self.set_next_run(NO_TIME)
         _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_VERSION.id}", self._version)
 
     def _enabled_topic(self) -> str:
@@ -478,10 +500,10 @@ class WateriusDevices:
                 for index, device in enumerate(config.devices)
             ]
 
-    def publish_meta(self) -> None:
-        self._integration_device.publish_meta()
+    def create(self) -> None:
+        self._integration_device.create()
         for key_device in self._key_devices:
-            key_device.publish_meta()
+            key_device.create()
 
     def subscribe(self) -> None:
         self._integration_device.subscribe()
