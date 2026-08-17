@@ -58,6 +58,9 @@ class FakeClient:
         self.subscribed: list[str] = []
         self.callbacks: dict[str, Callable] = {}
         self.on_connect: Optional[Callable] = None
+        self.will: Optional[tuple] = None
+        self.will_at_connect: Optional[tuple] = None
+        self.stopped = False
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain, qos))
@@ -78,14 +81,19 @@ class FakeClient:
     def message_callback_remove(self, topic: str) -> None:
         self.callbacks.pop(topic, None)
 
+    def will_set(self, topic: str, payload: str, retain: bool = False) -> None:
+        self.will = (topic, payload, retain)
+
     def start(self) -> None:
-        # Simulate the broker's CONNACK so a caller waiting on the connection event does not
-        # block. Real paho fires on_connect on the network thread.
+        # Real paho sends only the will registered before the connection, so remember what was
+        # armed by then. Then simulate the broker's CONNACK, otherwise a caller waiting on the
+        # connection event would block. Real paho fires on_connect on the network thread.
+        self.will_at_connect = self.will
         if self.on_connect is not None:
             self.on_connect(self, None, {}, 0)
 
     def stop(self) -> None:
-        pass
+        self.stopped = True
 
     def last(self, topic: str) -> Any:
         for published_topic, payload, _, _ in reversed(self.published):

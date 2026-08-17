@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        systemctl stop wb-mqtt-waterius.service 2>/dev/null || true
+        wb-mqtt-waterius cleanup 2>/dev/null || true
+        ;;
+esac
+
+#DEBHELPER#

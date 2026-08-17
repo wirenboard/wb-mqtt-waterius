@@ -146,7 +146,7 @@ def test_send_404_reports_key_not_found() -> None:
 
 
 def test_client_releases_its_session_on_exit() -> None:
-    # The context manager is the intended entry point: the session goes out with the cycle.
+    # The context manager is the intended entry point: the session goes out with the batch.
     session = _FakeSession(response=_FakeResponse(200))
     with _client(session) as client:
         assert client.send({"key": "K"}).ok
@@ -154,9 +154,9 @@ def test_client_releases_its_session_on_exit() -> None:
 
 
 def test_client_releases_its_session_on_exception() -> None:
-    # A cycle that blows up must not leak the pool — that is what the context manager is for.
+    # A batch that blows up must not leak the pool — that is what the context manager is for.
     session = _FakeSession(response=_FakeResponse(200))
     with pytest.raises(RuntimeError):
         with _client(session):
-            raise RuntimeError("cycle blew up")
+            raise RuntimeError("batch blew up")
     assert session.closed

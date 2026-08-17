@@ -33,9 +33,11 @@ DRIVER = "wb-mqtt-waterius"
 
 _KEY_DEVICE_ID_RE = re.compile(rf"^{re.escape(DEVICE_ID_PREFIX)}_\d+$")
 
-# Error flag for a control, see "Errors" in the WB conventions. Sending a reading out to the
-# cloud is a write, so "w".
+# Error flags for a control, see "Errors" in the WB conventions. Sending a reading out to the
+# cloud is a write, so "w". A daemon that died can neither read nor write, so its Last Will
+# says "rw".
 _ERROR_FLAG = "w"
+_WILL_ERROR_FLAG = "rw"
 
 # Finding our devices needs meta topics only. The "#" catches the JSON meta and per-field
 # meta subtopics alike.
@@ -86,7 +88,14 @@ STATE_ENUM = {
 
 class Control(NamedTuple):
     """
-    One WB control — the id it takes in the topic tree and the meta published for it.
+    Static description of one WB control — the id it takes in the topic tree and its meta.
+
+    The meta is the JSON the UI reads to render the control — ``type``, ``readonly``,
+    ``order``, bilingual ``title``, plus ``units`` on the meter channels and ``enum`` on the
+    state control.
+
+    Values are not part of it. The status and per-key controls below are module-level
+    constants shared by every device, while a value belongs to one device at one moment.
     """
 
     id: str
@@ -289,7 +298,7 @@ class PerKeyDevice:
         self._config_device = device
         self._base = f"/devices/{build_key_device_id(index)}"
         self._channels: list[Control] = []
-        self._control_ids_by_source_topic: dict[str, list[str]] = {}
+        self._controls_by_source_topic: dict[str, list[Control]] = {}
         # Restored from persistent state, kept current so a reconnect republishes it.
         self._last_sent = last_sent
         self._build_channels()
@@ -314,9 +323,15 @@ class PerKeyDevice:
             meta = {"type": wb_type, "readonly": True, "order": channel_index + 2, "title": title}
             if units:
                 meta["units"] = units
-            control_id = f"ch{channel_index}"
-            self._channels.append(Control(control_id, meta))
-            self._control_ids_by_source_topic.setdefault(channel.mqtt_topic, []).append(control_id)
+            control = Control(f"ch{channel_index}", meta)
+            self._channels.append(control)
+            self._controls_by_source_topic.setdefault(channel.mqtt_topic, []).append(control)
+
+    def _publish_control(self, control: Control, value: str) -> None:
+        _publish(self._client, f"{self._base}/controls/{control.id}", value)
+
+    def _publish_control_meta(self, control: Control) -> None:
+        _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
 
     def create(self) -> None:
         """
@@ -329,14 +344,14 @@ class PerKeyDevice:
         device_meta = {"driver": DRIVER, "title": self._title()}
         _publish(self._client, f"{self._base}/meta", json.dumps(device_meta))
         for control in self._channels + [KEY_LAST_SENT, KEY_LAST_ERROR]:
-            _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
+            self._publish_control_meta(control)
 
     def _publish_initial_values(self) -> None:
         for control in self._channels:
-            _publish(self._client, f"{self._base}/controls/{control.id}", "")
+            self._publish_control(control, "")
         # Restore the persisted "Last Sent". "Errors" starts empty.
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", self._last_sent)
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
+        self._publish_control(KEY_LAST_SENT, self._last_sent)
+        self._publish_control(KEY_LAST_ERROR, "")
         self._set_error(False)
 
     def update_channel(self, mqtt_topic: str, raw_value: Optional[str]) -> None:
@@ -346,12 +361,12 @@ class PerKeyDevice:
         The value is passed through untouched, so the mirror always shows what the source
         control shows.
         """
-        control_ids = self._control_ids_by_source_topic.get(mqtt_topic)
-        if not control_ids:
+        controls = self._controls_by_source_topic.get(mqtt_topic)
+        if not controls:
             return
         value = "" if raw_value is None else raw_value
-        for control_id in control_ids:
-            _publish(self._client, f"{self._base}/controls/{control_id}", value)
+        for control in controls:
+            self._publish_control(control, value)
 
     def _set_error(self, on: bool) -> None:
         """
@@ -371,15 +386,15 @@ class PerKeyDevice:
         The stamp is kept in the instance too, so a reconnect republishes it.
         """
         self._last_sent = timestamp
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_SENT.id}", timestamp)
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", "")
+        self._publish_control(KEY_LAST_SENT, timestamp)
+        self._publish_control(KEY_LAST_ERROR, "")
         self._set_error(False)
 
     def mark_failed(self, detail: str) -> None:
         """
         A failed send (API error or unavailable channels): show detail on "Errors".
         """
-        _publish(self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}", detail)
+        self._publish_control(KEY_LAST_ERROR, detail)
         self._set_error(True)
 
 
@@ -395,6 +410,27 @@ class IntegrationDevice:
         self._on_toggle = on_toggle
         self._version = version
 
+    def set_last_will(self) -> None:
+        """
+        Register the connection's Last Will, before the client connects.
+
+        A connection carries one will, so it goes to the state control. If the daemon dies
+        without clearing the flag, the broker raises it and the UI shows the integration red.
+        A healthy start wipes the flag along with everything else.
+        """
+        topic = f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}/meta/error"
+        self._client.will_set(topic, _WILL_ERROR_FLAG, retain=True)
+
+    def _publish_control(self, control: Control, value: str) -> None:
+        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}", value)
+
+    def _publish_control_meta(self, control: Control) -> None:
+        _publish(
+            self._client,
+            f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}/meta",
+            json.dumps(control.meta),
+        )
+
     def create(self) -> None:
         """
         Publish the device: meta for every control, then a starting value for each.
@@ -407,11 +443,7 @@ class IntegrationDevice:
         device_meta = {"driver": DRIVER, "title": title}
         _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/meta", json.dumps(device_meta))
         for control in STATUS_CONTROLS:
-            _publish(
-                self._client,
-                f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}/meta",
-                json.dumps(control.meta),
-            )
+            self._publish_control_meta(control)
 
     def _publish_initial_values(self) -> None:
         self.set_state(STATE_INITIALIZING)
@@ -419,16 +451,16 @@ class IntegrationDevice:
         self.set_enabled(False)
         self.set_current_time(NO_TIME)
         self.set_next_run(NO_TIME)
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_VERSION.id}", self._version)
+        self._publish_control(STATUS_VERSION, self._version)
 
     def _enabled_topic(self) -> str:
         return f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}/on"
 
-    def subscribe(self) -> None:
+    def subscribe_switch(self) -> None:
         self._client.subscribe(self._enabled_topic())
         self._client.message_callback_add(self._enabled_topic(), self._on_enabled)
 
-    def unsubscribe(self) -> None:
+    def unsubscribe_switch(self) -> None:
         """
         Drop the switch subscription and its callback, to be called before a wipe.
 
@@ -451,16 +483,16 @@ class IntegrationDevice:
         """
         Publish a numeric state code (see STATE_ENUM). The UI shows its label.
         """
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}", str(state))
+        self._publish_control(STATUS_STATE, str(state))
 
     def set_enabled(self, on: bool) -> None:
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}", "1" if on else "0")
+        self._publish_control(STATUS_ENABLED, "1" if on else "0")
 
     def set_current_time(self, text: str) -> None:
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_CURRENT_TIME.id}", text)
+        self._publish_control(STATUS_CURRENT_TIME, text)
 
     def set_next_run(self, text: str) -> None:
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_NEXT_EXECUTION.id}", text)
+        self._publish_control(STATUS_NEXT_EXECUTION, text)
 
     def set_error(self, on: bool) -> None:
         """
@@ -500,13 +532,19 @@ class WateriusDevices:
                 for index, device in enumerate(config.devices)
             ]
 
+    def set_last_will(self) -> None:
+        self._integration_device.set_last_will()
+
     def create(self) -> None:
         self._integration_device.create()
         for key_device in self._key_devices:
             key_device.create()
 
-    def subscribe(self) -> None:
-        self._integration_device.subscribe()
+    def subscribe_switch(self) -> None:
+        """
+        Subscribe to the automatic-sending switch. Only the integration device has one.
+        """
+        self._integration_device.subscribe_switch()
 
     def update_channel(self, mqtt_topic: str, raw_value: Optional[str]) -> None:
         for key_device in self._key_devices:
@@ -548,5 +586,5 @@ class WateriusDevices:
         Returns:
             the topics emptied, device meta included even where the broker held none
         """
-        self._integration_device.unsubscribe()
+        self._integration_device.unsubscribe_switch()
         return clear_all(self._client, timeout)

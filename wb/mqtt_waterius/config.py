@@ -156,7 +156,7 @@ def _find_duplicate_key(devices: list[Device]) -> Optional[str]:
     """
     Return the first key used by more than one device, None when all keys are unique.
 
-    Two devices sharing a key collapse the per-device daily dedup: the second one is skipped
+    Two devices sharing a key collapse into one in the saved state, so the second one counts
     as already sent today and never updates its display.
 
     Examples:

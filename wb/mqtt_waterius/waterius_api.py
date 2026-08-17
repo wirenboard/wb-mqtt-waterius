@@ -140,7 +140,7 @@ class WateriusClient:
 
     Owns one requests session, so devices sent one after another reuse the connection
     instead of a TLS handshake per key. Use as a context manager, one client per send
-    cycle: the session it owns lives and dies with it.
+    batch, the session it owns lives and dies with it.
 
     Args:
         endpoint: Waterius universal API URL
