@@ -9,7 +9,13 @@ from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError
 from typing import Any, Optional
 
-from wb.mqtt_waterius.service import CLIENT_ID, EXIT_FAILURE, main_cleanup, main_daemon, main_send_once
+from wb.mqtt_waterius.service import (
+    CLIENT_ID,
+    EXIT_FAILURE,
+    main_cleanup,
+    main_daemon,
+    main_send_once,
+)
 from wb.mqtt_waterius.version import get_version
 
 
