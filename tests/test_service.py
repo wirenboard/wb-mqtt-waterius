@@ -45,7 +45,7 @@ def _service(
 ) -> tuple[service.Service, FakeClient]:
     # Seed persisted state read in Service.__init__. stored_state overrides single keys, for the
     # tests that start from a state left by an earlier run.
-    stored = {"enabled": enabled, "last_sent_date": None, "schedule_time": None, "last_sent": {}}
+    stored = {"enabled": enabled, "schedule_time": None, "last_sent": {}}
     stored.update(stored_state or {})
     state.save_state(stored)
     client = FakeClient()
@@ -123,13 +123,15 @@ def test_on_toggle_persists_and_applies_state() -> None:
 
 
 @pytest.mark.parametrize(
-    "now, days_of_week, enabled, last_sent_date, expected",
+    "now, days_of_week, enabled, sent_today, expected",
     [
-        (datetime.datetime(2026, 7, 16, 11, 59), ALL_DAYS, True, None, False),
-        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, None, True),
-        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, "2026-07-16", False),
-        (datetime.datetime(2026, 7, 16, 12, 1), {0}, True, None, False),
-        (NOW, ALL_DAYS, False, None, False),
+        (datetime.datetime(2026, 7, 16, 11, 59), ALL_DAYS, True, False, []),
+        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, False, ["K1"]),
+        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, True, []),
+        (datetime.datetime(2026, 7, 16, 12, 1), {0}, True, False, []),
+        (NOW, ALL_DAYS, False, False, []),
+        (NOW, ALL_DAYS, True, False, ["K1"]),
+        (NOW, ALL_DAYS, True, True, ["K1"]),
     ],
     ids=[
         "before_the_minute",
@@ -137,57 +139,121 @@ def test_on_toggle_persists_and_applies_state() -> None:
         "past_the_minute_already_sent_today",
         "wrong_weekday",
         "automatic_sending_off",
+        "at_the_minute_sends",
+        "at_the_minute_sends_even_if_sent_today",
     ],
 )
-def test_should_send_now(
+def test_send_scheduled(  # pylint: disable=too-many-arguments
     now: datetime.datetime,
     days_of_week: set[int],
     enabled: bool,
-    last_sent_date: Optional[str],
-    expected: bool,
+    sent_today: bool,
+    expected: list[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The schedule rules as a table. Send time is 12:00, today is Thursday, so ALL_DAYS allows
-    # today and {0} (Monday) does not. Past the minute means a poll that missed the exact minute,
-    # and it catches up once — a restart must not skip the whole day or week, but it must not
-    # re-send either once the day is marked.
+    # today and {0} (Monday) does not. The scheduled minute sends regardless of the marks, past
+    # it only a device without today's mark goes out.
     config = _config(Device("K1", [Channel("d/c", 0)]), days_of_week=days_of_week)
-    service_instance, _ = _service(config, enabled=enabled, now=now)
-    service_instance._state["last_sent_date"] = last_sent_date
-    assert service_instance._should_send_now() is expected
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic: "10"}, enabled=enabled, now=now)
+    if sent_today:
+        mark = {"date": NOW.date().isoformat(), "stamp": "Thursday 2026-07-16 12:00"}
+        service_instance._state["last_sent"][state.key_hash("K1")] = mark
+    sent: list[str] = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
+    )
+    service_instance._send_scheduled()
+    assert sent == expected
 
 
-def test_should_send_now_at_the_exact_minute_fires_once() -> None:
-    # At exactly the scheduled minute the send fires even if today already sent, the scheduled time
-    # is authoritative. But _last_fire holds it to a single fire for that minute.
-    service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), now=NOW)  # 12:00 exact
-    service_instance._state["last_sent_date"] = NOW.date().isoformat()
-    assert service_instance._should_send_now() is True
-    service_instance._last_fire = (NOW.date().isoformat(), 12, 0)
-    assert service_instance._should_send_now() is False
+def test_send_scheduled_tries_a_failing_device_once_a_minute(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A reconnect wakes the poll early, so the same minute can come round twice. A device that
+    # failed must not be re-POSTed seconds later, the retry cadence is a minute.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic: "10"}, now=NOW)  # 12:00 exact
+    sent: list[str] = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(False, 503),
+    )
+    service_instance._send_scheduled()
+    service_instance._send_scheduled()
+    assert sent == ["K1"]
+
+    service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 16, 12, 1)
+    service_instance._send_scheduled()
+    assert sent == ["K1", "K1"]  # the next minute tries again
 
 
 @pytest.mark.parametrize(
-    "config_time, expected_marker, expected_send",
+    "config_time, expected_date, expected_sent",
     [
-        ("13:00", None, True),
-        ("12:00", "2026-07-16", False),
+        ("13:00", None, ["K1"]),
+        ("12:00", "2026-07-16", []),
     ],
-    ids=["a_new_time_reopens_the_day", "the_same_time_keeps_the_marker"],
+    ids=["a_new_time_reopens_the_day", "the_same_time_keeps_the_marks"],
 )
-def test_day_marker_after_a_restart(
-    config_time: str, expected_marker: Optional[str], expected_send: bool
+def test_marks_after_a_restart(
+    config_time: str,
+    expected_date: Optional[str],
+    expected_sent: list[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The stored state says today was already sent, for a 12:00 slot. A config with a new time is a
-    # new slot, so today sends once more, while the same time means a plain restart must not.
+    # The stored state says the device already sent today, for a 12:00 slot. A config with a new
+    # time is a new slot, so it sends once more, while the same time means a plain restart must not.
     config = Config(config_time, [Device("K1", [Channel("d/c", 0)])], days_of_week=ALL_DAYS)
+    topic = config.devices[0].channels[0].mqtt_topic
+    stamp = "Thursday 2026-07-16 12:00"
     service_instance, _ = _service(
         config,
+        values={topic: "10"},
         now=datetime.datetime(2026, 7, 16, 13, 5),
-        stored_state={"last_sent_date": "2026-07-16", "schedule_time": "12:00"},
+        stored_state={
+            "last_sent": {state.key_hash("K1"): {"date": "2026-07-16", "stamp": stamp}},
+            "schedule_time": "12:00",
+        },
     )
-    assert service_instance._state["last_sent_date"] == expected_marker
+    mark = service_instance._state["last_sent"][state.key_hash("K1")]
+    assert mark["date"] == expected_date
+    assert mark["stamp"] == stamp  # the card keeps showing the last send either way
     assert service_instance._state["schedule_time"] == config_time
-    assert service_instance._should_send_now() is expected_send
+    sent: list[str] = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
+    )
+    service_instance._send_scheduled()
+    assert sent == expected_sent
+
+
+def test_a_new_send_time_fires_again_the_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 12:00 went through, then the user moves the send time to 15:00 in the configurator. The
+    # restart that follows the config write reopens the day, and 15:00 fires once more.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic: "10"}, now=NOW)  # 12:00 exact
+    sent: list[str] = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
+    )
+    service_instance._send_scheduled()
+    assert sent == ["K1"]
+
+    moved = Config("15:00", config.devices, days_of_week=ALL_DAYS)
+    restarted = service.Service(
+        moved,
+        endpoint="http://test",
+        datetime_now_fn=lambda: datetime.datetime(2026, 7, 16, 15, 0),
+        client=FakeClient(),
+    )
+    restarted._source_values = {topic: "10"}
+    restarted._send_scheduled()
+    assert sent == ["K1", "K1"]
 
 
 def test_send_now_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,7 +265,7 @@ def test_send_now_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_ACTIVE)
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent")  # stamped
-    assert service_instance._state["last_sent_date"] == NOW.date().isoformat()
+    assert service_instance._state["last_sent"][state.key_hash("K1")]["date"] == NOW.date().isoformat()
 
 
 def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,10 +282,12 @@ def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     assert service_instance.send_now() is False
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == "w"
-    # The day is marked as sent because the send did happen, and the transient failure is queued
-    # for retry via the poll loop, not by running the whole schedule again.
-    assert service_instance._state["last_sent_date"] == NOW.date().isoformat()
-    assert service_instance._pending_retry == {1}  # K2 queued for retry
+    # K1 carries today's mark and K2 does not, so the next poll re-sends K2 alone. That mark is
+    # also what a restart reads, the retry does not live in memory.
+    marks = service_instance._state["last_sent"]
+    assert marks[state.key_hash("K1")]["date"] == NOW.date().isoformat()
+    assert state.key_hash("K2") not in marks
+    assert service_instance._failed_transient == {1}  # K2 shown red until it goes through
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error") == "HTTP 503"
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error/meta/error") == "w"
 
@@ -275,7 +343,7 @@ def test_dry_run_builds_no_client_and_has_no_side_effects(monkeypatch: pytest.Mo
     topic = config.devices[0].channels[0].mqtt_topic
     service_instance, client = _service(config, values={topic: "10"})
     assert service_instance.dry_run_payloads() is True
-    assert service_instance._state["last_sent_date"] is None
+    assert not service_instance._state["last_sent"]
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") is None
 
 
@@ -385,9 +453,9 @@ def test_run_arms_the_last_will_before_connecting_and_stops_the_client() -> None
     assert client.stopped
 
 
-def test_send_now_interrupted_does_not_mark_day_sent(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Shutdown landing in the inter-device gap must not record the day as sent, or the
-    # unsent devices are silently skipped until tomorrow.
+def test_send_now_interrupted_leaves_the_rest_unsent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Shutdown landing in the inter-device gap must leave the untouched devices without today's
+    # mark, or they are silently skipped until tomorrow.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     topic1 = config.devices[0].channels[0].mqtt_topic
     topic2 = config.devices[1].channels[0].mqtt_topic
@@ -400,11 +468,11 @@ def test_send_now_interrupted_does_not_mark_day_sent(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(service_instance._stop_event, "wait", lambda _seconds: True)  # SIGTERM in the gap
     assert service_instance.send_now() is False
     assert sent == ["K1"]  # only the first device was sent before the abort
-    assert service_instance._state["last_sent_date"] is None  # day not marked -> same-day retry preserved
-    # The stamp of the device that DID send is persisted to disk (survives restart)...
-    persisted = state.load_state()
-    assert persisted["last_sent"][state.key_hash("K1")]
-    assert persisted["last_sent_date"] is None  # ...but the day stays unmarked on disk too
+    # The mark of the device that DID send is on disk and K2 has none, so K2 is still unsent.
+    persisted = state.load_state()["last_sent"]
+    assert persisted[state.key_hash("K1")]["date"] == NOW.date().isoformat()
+    assert state.key_hash("K2") not in persisted
+    assert service_instance._get_unsent_devices(NOW.date().isoformat()) == [1]
 
 
 def test_per_device_timestamp_persisted_and_restored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -414,7 +482,7 @@ def test_per_device_timestamp_persisted_and_restored(monkeypatch: pytest.MonkeyP
     _patch_send(monkeypatch, lambda *args, **kwargs: waterius_api.SendResult(True, 200))
     service_instance.send_now()
     digest = state.key_hash("K1")
-    stamp = state.load_state()["last_sent"][digest]
+    stamp = state.load_state()["last_sent"][digest]["stamp"]
     assert stamp  # per-device timestamp persisted to the state file
 
     # A fresh Service (same config) restores that timestamp onto the key device.
@@ -453,13 +521,10 @@ def test_timestamp_is_taken_per_device_not_per_batch(monkeypatch: pytest.MonkeyP
 def test_stale_device_timestamps_pruned() -> None:
     stale = state.key_hash("OLD")
     keep = state.key_hash("K1")
+    stale_mark = {"date": "2026-07-15", "stamp": "Wednesday 2026-07-15 10:00"}
+    kept_mark = {"date": "2026-07-16", "stamp": "Thursday 2026-07-16 12:00"}
     state.save_state(
-        {
-            "enabled": True,
-            "last_sent_date": None,
-            "schedule_time": "12:00",
-            "last_sent": {stale: "2026-07-15 10:00:00", keep: "2026-07-16 12:00:00"},
-        }
+        {"enabled": True, "schedule_time": "12:00", "last_sent": {stale: stale_mark, keep: kept_mark}}
     )
     config = Config("12:00", [Device("K1", [Channel("d/c", 0)])], days_of_week=ALL_DAYS)
     service_instance = service.Service(
@@ -467,29 +532,30 @@ def test_stale_device_timestamps_pruned() -> None:
     )
     assert keep in service_instance._state["last_sent"]
     assert stale not in service_instance._state["last_sent"]  # dropped on startup
-    assert state.load_state()["last_sent"] == {keep: "2026-07-16 12:00:00"}  # rewritten to disk
+    assert state.load_state()["last_sent"] == {keep: kept_mark}  # rewritten to disk
 
 
-def test_send_now_sends_all_even_if_one_sent_earlier(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The scheduled send decides, it POSTs every device with fresh values, even one
-    # already stamped earlier today. Devices are never skipped one by one.
+def test_manual_send_ignores_todays_marks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The manual send has no rules: every device goes out with fresh values, even one already
+    # sent earlier today.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     topic1 = config.devices[0].channels[0].mqtt_topic
     topic2 = config.devices[1].channels[0].mqtt_topic
     service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
-    service_instance._state["last_sent"][state.key_hash("K1")] = "2026-07-16 08:00:00"
+    mark = {"date": "2026-07-16", "stamp": "Thursday 2026-07-16 08:00"}
+    service_instance._state["last_sent"][state.key_hash("K1")] = mark
     sent = []
     _patch_send(
         monkeypatch,
         lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
     )
     assert service_instance.send_now() is True
-    assert sent == ["K1", "K2"]  # both sent, K1 not skipped despite an earlier stamp
-    assert service_instance._state["last_sent_date"] == NOW.date().isoformat()
+    assert sent == ["K1", "K2"]  # both sent, K1 not skipped despite today's mark
 
 
-def test_send_now_permanent_404_marks_day_and_holds(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A 404 (key not registered) is held red without retry, the day is still marked as sent.
+def test_send_now_permanent_404_holds_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 404 (key not registered) is held red and left out of the catch-up, chasing an
+    # unregistered key for the rest of the day is pointless.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     topic1 = config.devices[0].channels[0].mqtt_topic
     topic2 = config.devices[1].channels[0].mqtt_topic
@@ -506,14 +572,14 @@ def test_send_now_permanent_404_marks_day_and_holds(monkeypatch: pytest.MonkeyPa
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error") == waterius_api.KEY_NOT_FOUND_ERROR
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error/meta/error") == "w"
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
-    assert service_instance._state["last_sent_date"] == NOW.date().isoformat()  # day done despite 404
-    assert service_instance._failed_hold == {1}  # K2 held, not queued for retry
-    assert service_instance._pending_retry == set()
+    assert service_instance._failed_hold == {1}  # K2 held
+    assert service_instance._failed_transient == set()
+    assert not service_instance._get_unsent_devices(NOW.date().isoformat())  # held, not retried today
 
 
-def test_retry_pending_resends_only_failed_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
-    # After a fire leaves K2 transiently failed, the poll retry re-POSTs only K2; on success
-    # it clears and the integration device returns to Active.
+def test_catch_up_resends_only_the_unsent_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    # After a fire leaves K2 transiently failed, the next poll past the minute re-POSTs only K2.
+    # On success it clears and the integration device returns to Active.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     topic1 = config.devices[0].channels[0].mqtt_topic
     topic2 = config.devices[1].channels[0].mqtt_topic
@@ -529,28 +595,65 @@ def test_retry_pending_resends_only_failed_and_recovers(monkeypatch: pytest.Monk
 
     _patch_send(monkeypatch, fake_send)
     service_instance.send_now()
-    assert service_instance._pending_retry == {1}
+    assert service_instance._failed_transient == {1}
 
     calls.clear()
     fail_k2["on"] = False  # K2 recovers
-    service_instance._retry_pending()
-    assert calls == ["K2"]  # only the failed device retried, not K1
-    assert service_instance._pending_retry == set()
+    service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 16, 12, 1)
+    service_instance._send_scheduled()
+    assert calls == ["K2"]  # only the unsent device retried, not K1
+    assert service_instance._failed_transient == set()
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_ACTIVE)
 
 
-def test_retry_pending_if_same_day_holds_on_rollover() -> None:
-    # A day rollover stops the retry, the still-failed device is moved to hold (stays red)
-    # not retried across days.
+def test_no_catch_up_after_the_day_rolls_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past midnight yesterday's reading is stale, so a device that failed is not chased any
+    # more. The next scheduled fire rebuilds everything anyway.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    service_instance, client = _service(config)
-    service_instance._pending_retry = {0}
-    service_instance._pending_day = datetime.date(2026, 7, 16)
-    service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 17, 0, 5)  # next day
-    service_instance._retry_pending_if_same_day()
-    assert service_instance._pending_retry == set()
-    assert service_instance._failed_hold == {0}
-    assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic: "10"})
+    calls = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: calls.append(payload["key"]) or waterius_api.SendResult(False, 503),
+    )
+    service_instance.send_now()
+    calls.clear()
+    service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 17, 0, 5)  # before 12:00
+    service_instance._send_scheduled()
+    assert not calls
+
+
+def test_a_restart_resumes_the_device_left_unsent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The point of the per-device marks. K1 went through and K2 did not, and nothing about the
+    # retry lives in memory — a fresh Service on the same state file sends K2 alone.
+    config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
+    topic1 = config.devices[0].channels[0].mqtt_topic
+    topic2 = config.devices[1].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
+    calls = []
+    fail_k2 = {"on": True}
+
+    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+        calls.append(payload["key"])
+        if payload["key"] == "K2" and fail_k2["on"]:
+            return waterius_api.SendResult(False, 503)
+        return waterius_api.SendResult(True, 200)
+
+    _patch_send(monkeypatch, fake_send)
+    service_instance.send_now()
+
+    restarted = service.Service(
+        config,
+        endpoint="http://test",
+        datetime_now_fn=lambda: datetime.datetime(2026, 7, 16, 12, 5),
+        client=FakeClient(),
+    )
+    restarted._source_values = {topic1: "10", topic2: "20"}
+    calls.clear()
+    fail_k2["on"] = False  # K2 recovers while the service was down
+    restarted._send_scheduled()
+    assert calls == ["K2"]
 
 
 def test_main_daemon_config_error_reports_invalid_state(

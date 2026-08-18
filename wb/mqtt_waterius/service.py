@@ -113,15 +113,14 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._wake_event = threading.Event()  # interrupts the poll sleep (reconnect or stop)
 
         self._source_values: dict[str, str] = {}  # mqtt topic -> raw string payload
-        self._pending_retry: set[int] = set()  # device indices with a transient error, retried each poll
+        self._failed_transient: set[int] = set()  # device indices that failed their last attempt
         self._failed_hold: set[int] = set()  # device indices errored but not retried (404 or gave up)
-        self._pending_day: Optional[datetime.date] = None  # day of the send batch, scopes the retry
-        self._last_fire: Optional[tuple[str, int, int]] = None  # (date, hour, minute) of the last send
+        self._last_schedule_run: Optional[tuple[str, int, int]] = None  # (date, hour, minute) already run
         self._last_next_run: Optional[str] = None  # last published "Next Execution", skips repeats
 
         self._state = load_state()
-        self._reset_day_marker_if_time_changed()
-        restore = self._prune_display_timestamps()
+        self._reset_marks_if_time_changed()
+        stamps = self._prune_device_marks()
         self._enabled = self._state["enabled"]
 
         # client is injectable for tests and for the entry points that need a distinct id
@@ -132,34 +131,43 @@ class Service:  # pylint: disable=too-many-instance-attributes
             on_toggle=self._on_toggle,
             config=config,
             version=get_version(),
-            last_sent=restore,
+            last_sent=stamps,
         )
 
-    def _reset_day_marker_if_time_changed(self) -> None:
+    def _reset_marks_if_time_changed(self) -> None:
         """
-        A new scheduled time is a new slot, so the day stops counting as sent.
+        A new scheduled time is a new slot, so nobody counts as sent for today any more.
 
         This matters in one case only, when the new time has already passed today and today
-        was already sent. Without the reset that edit would take effect tomorrow.
+        was already sent. Without the reset that edit would take effect tomorrow. The stamps
+        stay, they are what the cards show.
         """
-        if self._state["schedule_time"] != self._config.send_time:
-            self._save_state_values(last_sent_date=None, schedule_time=self._config.send_time)
+        if self._state["schedule_time"] == self._config.send_time:
+            return
+        cleared = {
+            hashed_key: {"date": None, "stamp": mark["stamp"]}
+            for hashed_key, mark in self._state["last_sent"].items()
+        }
+        self._save_state_values(last_sent=cleared, schedule_time=self._config.send_time)
 
-    def _prune_display_timestamps(self) -> list[str]:
+    def _prune_device_marks(self) -> list[str]:
         """
-        Drop the stamps of devices no longer in the config, then persist what is left.
+        Drop the marks of devices no longer in the config, then persist what is left.
+
+        Runs on startup, and a config edit restarts the service, so a key removed from the
+        configurator takes its mark out of the state file with it.
 
         Returns:
             Stamps of the configured devices in config order, empty for a device with none
         """
         key_hashes = [key_hash(device.key) for device in self._config.devices]
         kept = {
-            hashed_key: stamp
-            for hashed_key, stamp in self._state["last_sent"].items()
+            hashed_key: mark
+            for hashed_key, mark in self._state["last_sent"].items()
             if hashed_key in key_hashes
         }
         self._save_state_values(last_sent=kept)
-        return [kept.get(hashed_key, "") for hashed_key in key_hashes]
+        return [kept.get(hashed_key, {}).get("stamp", "") for hashed_key in key_hashes]
 
     def _apply_resting_state(self) -> None:
         """
@@ -248,7 +256,8 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
         WB publishes channel values retained, so normally they are already here and nothing
         is waited for. The wait covers one case, a send starting seconds after the service
-        did. The minute retries do not wait again, by then a missing value is really missing.
+        did. A catch-up batch waits the same way, bounded by READINGS_TIMEOUT and free when
+        the values are already in.
 
         A value that never arrives is not reported here. The device that needs it is skipped
         by the send itself, which names both the device and the topics.
@@ -341,10 +350,11 @@ class Service:  # pylint: disable=too-many-instance-attributes
         if result.ok:
             # Stamped when this device answered, not when the batch started, because devices
             # are sent one at a time and a retried one answers minutes later.
-            timestamp = self._datetime_now().strftime(TIMESTAMP_FORMAT)
+            now = self._datetime_now()
+            timestamp = now.strftime(TIMESTAMP_FORMAT)
             self._wb_devices.mark_device_sent(index, timestamp)
-            stamps = {**self._state["last_sent"], key_hash(device.key): timestamp}
-            self._save_state_values(last_sent=stamps)
+            mark = {"date": now.date().isoformat(), "stamp": timestamp}
+            self._save_state_values(last_sent={**self._state["last_sent"], key_hash(device.key): mark})
             return SEND_OK
 
         self._wb_devices.mark_device_failed(index, result.error or f"HTTP {result.status_code}")
@@ -390,12 +400,26 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
     def send_now(self) -> bool:
         """
-        Full scheduled send, POSTs every configured device once.
+        Send every configured device once, today's marks ignored and rewritten.
 
-        Devices are not skipped one by one. The scheduled time decides, so a device already
-        sent earlier today goes out again with fresh values. Transient failures go to the
-        retry queue, a 404 is held red without retry. Marks the day as sent and returns True
-        only if nothing errored. Safe from any thread.
+        Used by the scheduled minute and by the manual `wb-mqtt-waterius send`, both of which
+        mean "put the current readings in the cabinet" regardless of what went out earlier
+        today. Safe from any thread.
+        """
+        return self._send_batch(list(range(len(self._config.devices))))
+
+    def _send_batch(self, indices: list[int]) -> bool:
+        """
+        Send the given devices once and reflect the outcome on the WB devices.
+
+        A device that went through is marked for today in _send_device, and that mark is what
+        keeps the next poll pass, and a restart, from sending it again.
+
+        Args:
+            indices: 0-based positions in the config, in send order
+
+        Returns:
+            True when every device of the batch was accepted
         """
         with self._send_lock:
             if not self._config.devices:
@@ -405,74 +429,79 @@ class Service:  # pylint: disable=too-many-instance-attributes
                 return False
 
             self._await_readings()
-            now = self._datetime_now()
-            today = now.date().isoformat()
-            all_device_indices = list(range(len(self._config.devices)))
-
-            pending, held, aborted = self._send_devices_data(all_device_indices)
-            self._pending_retry = pending
-            self._failed_hold = held
-            self._pending_day = now.date()
-
-            # Mark the day as sent, with the minute it happened, so the schedule does not
-            # start over today. Transient devices retry via the poll loop instead.
-            # An aborted send (SIGTERM mid-way) leaves the day open so a restart catches up.
-            if not aborted:
-                self._last_fire = (today, now.hour, now.minute)
-                self._save_state_values(last_sent_date=today, schedule_time=self._config.send_time)
+            pending, held, aborted = self._send_devices_data(indices)
+            # Only the devices of this batch change verdict, the ones left out keep theirs.
+            batch = set(indices)
+            self._failed_transient = (self._failed_transient - batch) | pending
+            self._failed_hold = (self._failed_hold - batch) | held
 
             self._update_integration_error()
             if aborted:
                 return False
             return not (pending or held)
 
-    def _retry_pending(self) -> None:
+    def _get_unsent_devices(self, today: str) -> list[int]:
         """
-        Re-POST only the devices that had a transient error, once.
+        Devices with no successful send today, in config order.
 
-        Runs on the poll loop every minute until they succeed. A success clears the device,
-        a 404 moves it to hold.
+        This is the whole retry mechanism. A device that failed, one whose value had not
+        arrived yet and one that was never tried because the service was down all look the
+        same here, so a restart resumes the day instead of losing it. Devices held after a
+        404 stay out, retrying an unregistered key today is pointless.
+
+        Args:
+            today: current date as an ISO string, the device marks are compared against it
         """
-        with self._send_lock:
-            if not self._pending_retry:
-                return
-            pending, held, _aborted = self._send_devices_data(sorted(self._pending_retry))
-            self._pending_retry = pending
-            self._failed_hold |= held
-        self._update_integration_error()
+        marks = self._state["last_sent"]
+        return [
+            index
+            for index, device in enumerate(self._config.devices)
+            if index not in self._failed_hold and marks.get(key_hash(device.key), {}).get("date") != today
+        ]
 
     def _update_integration_error(self) -> None:
         """
         Aggregate device errors onto the integration device.
 
-        Red plus Has Errors if anything is pending-retry or held, otherwise the resting
+        Red plus Has Errors if anything failed its last attempt or is held, otherwise the resting
         state — Active, Disabled or Config Not Valid.
         """
-        if self._pending_retry or self._failed_hold:
+        if self._failed_transient or self._failed_hold:
             self._wb_devices.set_integration_error(True)
             self._wb_devices.set_state(STATE_HAS_ERRORS)
         else:
             self._apply_resting_state()
 
-    def _should_send_now(self) -> bool:
+    def _send_scheduled(self) -> None:
         """
-        Whether a full scheduled send should fire now.
+        The automatic send of one poll pass.
 
-        At exactly the scheduled minute it always fires, even if already sent today, but
-        only once for that minute. Past the minute, which means a missed poll, it catches
-        up once if today has not sent yet.
+        The scheduled minute itself always sends every device — that is the promise of the
+        schedule, and a changed send time is a new slot that fires again the same day. Only
+        the repeats after that minute go by the marks: a device without one for today is sent
+        again, which covers a failure, a minute missed by a restart and a restart itself, while
+        a device held after a 404 waits for the next slot. The manual send obeys none of this,
+        see send_now.
         """
         if not self._enabled or not self._config.devices:
-            return False
+            return
         now = self._datetime_now()
         if now.weekday() not in self._config.days_of_week:
-            return False
+            return
+        if (now.hour, now.minute) < (self._send_hour, self._send_minute):
+            return
         today = now.date().isoformat()
+        # A reconnect wakes the poll early, so the same minute can come round twice. Without
+        # this the slot would fire twice and a failed device would be re-POSTed seconds apart.
+        if self._last_schedule_run == (today, now.hour, now.minute):
+            return
+        self._last_schedule_run = (today, now.hour, now.minute)
         if (now.hour, now.minute) == (self._send_hour, self._send_minute):
-            return self._last_fire != (today, self._send_hour, self._send_minute)
-        if (now.hour, now.minute) > (self._send_hour, self._send_minute):
-            return self._state["last_sent_date"] != today
-        return False
+            self.send_now()
+            return
+        unsent = self._get_unsent_devices(today)
+        if unsent:
+            self._send_batch(unsent)
 
     def _on_connect(self, _client: MQTTClient, _userdata: Any, _flags: Any, rc: int) -> None:
         """
@@ -491,21 +520,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
     def _on_disconnect(self, _client: MQTTClient, _userdata: Any, rc: int) -> None:
         if rc != 0:
             logger.warning("MQTT disconnected (rc=%s), paho will reconnect", rc)
-
-    def _retry_pending_if_same_day(self) -> None:
-        """
-        Retry the pending devices, but only within the day of the send.
-
-        At a day rollover the reading is stale, so retrying stops and the still-failed
-        devices are held as errored, shown red, until the next scheduled send rebuilds
-        everything.
-        """
-        if self._datetime_now().date() == self._pending_day:
-            self._retry_pending()
-        else:
-            self._failed_hold |= self._pending_retry
-            self._pending_retry = set()
-            self._update_integration_error()
 
     def _setup_mqtt(self) -> None:
         """
@@ -540,8 +554,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         One pass of the poll loop, once a minute and right after a (re)connect.
 
         The MQTT setup is repeated only when a connect asked for it, not on every pass. Then
-        the displayed times are refreshed, and then either the scheduled send fires or the
-        devices left over from it are retried.
+        the displayed times are refreshed, and then the schedule decides what to send.
         """
         if self._resetup_event.is_set():
             self._resetup_event.clear()
@@ -549,10 +562,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
         self._refresh_time_display()
 
-        if self._should_send_now():
-            self.send_now()
-        elif self._pending_retry:
-            self._retry_pending_if_same_day()
+        self._send_scheduled()
 
     def run(self) -> None:
         self._client.on_connect = self._on_connect

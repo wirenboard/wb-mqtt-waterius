@@ -2,15 +2,16 @@
 Persistent runtime state for wb-mqtt-waterius.
 
 A single JSON file under /var/lib that survives a restart of the service and of the broker.
-It holds the automatic-sending switch, the marker of the day already sent and the per-device
-display timestamps. Reading and writing is all this module does, the rules around the values
-live in the service.
+It holds the automatic-sending switch, the time the marks below were made for, and a mark per
+device — the day it last sent and the stamp its card shows. Reading and writing is all this
+module does, the rules around the values live in the service.
 """
 
 import hashlib
 import json
 import logging
 import os
+from typing import Any
 
 STATE_DIR = "/var/lib/wb-mqtt-waterius"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -39,10 +40,12 @@ def load_state() -> dict:
     Load the persistent runtime state, falling back to safe defaults.
 
     - ``enabled`` — automatic sending on or off.
-    - ``last_sent_date`` with ``schedule_time`` — the day already sent and the time it was
-      sent for. A restart reads them instead of sending again, and a changed time counts as
-      a new slot, so it sends once more that day.
-    - ``last_sent`` — per-device display timestamps, keyed by a hash of the device key.
+    - ``schedule_time`` — the time the marks below were made for. A changed time counts as a
+      new slot, so the marks are dropped and the day sends once more.
+    - ``last_sent`` — per-device ``{"date", "stamp"}``, keyed by a hash of the device key.
+      The date says who already sent today, so a restart resumes instead of losing the day.
+      The stamp is what the device card shows. Marks of devices dropped from the config are
+      removed by the service on startup.
     """
     try:
         with open(STATE_FILE, encoding="utf-8") as handle:
@@ -51,12 +54,29 @@ def load_state() -> dict:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    per_device = data.get("last_sent")
     return {
         "enabled": bool(data.get("enabled", True)),
-        "last_sent_date": data.get("last_sent_date"),
         "schedule_time": data.get("schedule_time"),
-        "last_sent": per_device if isinstance(per_device, dict) else {},
+        "last_sent": _get_device_marks(data.get("last_sent")),
+    }
+
+
+def _get_device_marks(raw: Any) -> dict:
+    """
+    Keep the well-formed marks and drop the rest, a hand-edited file must not crash the daemon.
+
+    Examples:
+        >>> _get_device_marks({"a1b2": {"date": "2026-08-18", "stamp": "Tuesday 2026-08-18 03:00"}})
+        {'a1b2': {'date': '2026-08-18', 'stamp': 'Tuesday 2026-08-18 03:00'}}
+        >>> _get_device_marks({"a1b2": "Tuesday 2026-08-18 03:00"})
+        {}
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        hashed_key: {"date": mark.get("date"), "stamp": mark.get("stamp", "")}
+        for hashed_key, mark in raw.items()
+        if isinstance(mark, dict)
     }
 
 
