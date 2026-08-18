@@ -171,3 +171,25 @@ def test_channel_serial_optional() -> None:
     cfg = config.parse_config(data)
     assert cfg.devices[0].channels[0].serial == "1001"
     assert cfg.devices[0].channels[1].serial is None
+
+
+def test_channel_serial_too_long() -> None:
+    # A longer serial makes Waterius drop the whole request, so the config is refused instead.
+    data = {
+        "sendTime": "03:00",
+        "daysOfWeek": ["monday"],
+        "devices": [
+            {
+                "key": "K",
+                "channels": [
+                    {"mqttTopicName": "d/a", "dataType": 0, "serial": "1" * (config.MAX_SERIAL_LENGTH + 1)}
+                ],
+            }
+        ],
+    }
+    with pytest.raises(config.ConfigError):
+        config.parse_config(data)
+
+    at_the_limit = "1" * config.MAX_SERIAL_LENGTH
+    data["devices"][0]["channels"][0]["serial"] = at_the_limit
+    assert config.parse_config(data).devices[0].channels[0].serial == at_the_limit

@@ -1,3 +1,4 @@
+import json
 import threading
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -12,6 +13,10 @@ from wb.mqtt_waterius import waterius_api
 class _FakeResponse:
     status_code: int
     text: str = ""
+
+    def json(self) -> Any:
+        # Like requests, a body that is not JSON raises a ValueError subclass.
+        return json.loads(self.text)
 
 
 class _FakeSession:
@@ -132,6 +137,22 @@ def test_send_400_not_retried() -> None:
     assert not result.ok
     assert result.status_code == 400
     assert len(session.calls) == 1  # non-retryable, stops immediately
+
+
+def test_send_400_reports_server_explanation() -> None:
+    # The body names the offending fields, which is more useful than the status code alone.
+    session = _SeqSession([_FakeResponse(400, '"Incorrect fields: serial0"')])
+    result = _client(session).send({"key": ""})
+    assert not result.ok
+    assert result.status_code == 400
+    assert result.error == "Incorrect fields: serial0"
+
+
+def test_send_ignores_a_body_that_is_not_json() -> None:
+    session = _SeqSession([_FakeResponse(500, "<html>500 Internal Server Error</html>")])
+    result = _client(session).send({"key": ""})
+    assert result.status_code == 500
+    assert result.error is None  # the UI falls back to the status code
 
 
 def test_send_404_reports_key_not_found() -> None:

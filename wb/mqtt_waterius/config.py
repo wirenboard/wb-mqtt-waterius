@@ -17,6 +17,10 @@ TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 # rows. This check is for a hand-edited config file.
 MAX_CHANNELS = 4
 
+# Waterius rejects a longer serial with HTTP 400 and drops the whole request, so one long
+# serial loses the readings of every meter on the key.
+MAX_SERIAL_LENGTH = 15
+
 # Waterius data-type codes. A code outside the range does not exist and the cloud renders an
 # unknown one as water, so a typo would silently land in the wrong meter.
 DATA_TYPES = range(10)
@@ -136,7 +140,13 @@ def _parse_channel(raw_channel: dict) -> Channel:
             f"channel {topic!r} has unknown dataType {data_type}, "
             f"expected {min(DATA_TYPES)}..{max(DATA_TYPES)}"
         )
-    return Channel(topic, data_type, raw_channel.get("serial"))
+    serial = raw_channel.get("serial")
+    serial_length = len(str(serial)) if serial else 0
+    if serial_length > MAX_SERIAL_LENGTH:
+        raise ConfigError(
+            f"channel {topic!r} has a {serial_length}-character serial, max is {MAX_SERIAL_LENGTH}"
+        )
+    return Channel(topic, data_type, serial)
 
 
 def _parse_device(raw_device: dict) -> Device:

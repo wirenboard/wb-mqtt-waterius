@@ -30,6 +30,10 @@ RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 KEY_NOT_FOUND_CODE = 404
 KEY_NOT_FOUND_ERROR = "Key not accepted by Waterius"
 
+# The body of a rejected request names the offending fields. Trimmed to stay readable in
+# a UI control.
+MAX_ERROR_LENGTH = 100
+
 log = logging.getLogger(__name__)
 
 
@@ -134,6 +138,29 @@ def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[s
     return payload
 
 
+def _response_error(response: requests.Response) -> Optional[str]:
+    """
+    Failure reason from the body of a rejected response, None when the body says nothing.
+
+    Examples:
+        >>> class _Rejected:  # stands in for requests.Response
+        ...     text = '["Incorrect fields: serial0"]'
+        ...     def json(self):
+        ...         return ["Incorrect fields: serial0"]
+        >>> _response_error(_Rejected())
+        'Incorrect fields: serial0'
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None  # an error page of the proxy in front of Waterius, not an explanation
+    if isinstance(body, list):
+        body = ", ".join(str(item) for item in body)
+    elif not isinstance(body, str):
+        body = response.text
+    return body.strip()[:MAX_ERROR_LENGTH] or None
+
+
 class WateriusClient:
     """
     Client of the Waterius universal API.
@@ -186,8 +213,9 @@ class WateriusClient:
         POST one device's readings to Waterius.
 
         Never raises on a transport failure. Transient ones (nginx 503, 429/502/504, network
-        errors) are retried with a linear backoff. A non-retryable HTTP error returns at once,
-        and a 404 means the key is not registered (invalid or revoked).
+        errors) are retried with a linear backoff. A non-retryable HTTP error returns at once
+        with the server's own explanation, and a 404 means the key is not registered (invalid
+        or revoked).
 
         Args:
             payload: request body from build_payload
@@ -218,7 +246,10 @@ class WateriusClient:
                 if 200 <= response.status_code < 300:
                     return SendResult(ok=True, status_code=response.status_code)
                 if response.status_code not in RETRYABLE_STATUS_CODES:
-                    error = KEY_NOT_FOUND_ERROR if response.status_code == KEY_NOT_FOUND_CODE else None
+                    if response.status_code == KEY_NOT_FOUND_CODE:
+                        error = KEY_NOT_FOUND_ERROR
+                    else:
+                        error = _response_error(response)
                     log.error("Waterius returned HTTP %s: %s", response.status_code, response.text[:200])
                     return SendResult(ok=False, status_code=response.status_code, error=error)
                 last_failure = SendResult(ok=False, status_code=response.status_code)
