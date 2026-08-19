@@ -23,6 +23,14 @@ def test_state_roundtrip() -> None:
     assert loaded["last_sent"] == {"a1b2c3d4e5f6": moment}
 
 
+def test_the_raw_key_never_reaches_the_state_file() -> None:
+    # The map is keyed by a hash so the file carries no credential of its own.
+    key = "01234567890123456789012345678901"
+    assert state.key_hash(key) != key
+    state.save_state({"enabled": True, "last_sent": {state.key_hash(key): "2026-07-16T12:00:00"}})
+    assert key not in Path(state.STATE_FILE).read_text(encoding="utf-8")
+
+
 def test_state_drops_a_moment_it_cannot_read() -> None:
     # A hand-edited file must not crash the daemon. The device simply counts as never sent.
     state.save_state({"enabled": True, "last_sent": {"a1b2c3d4e5f6": "вчера"}})

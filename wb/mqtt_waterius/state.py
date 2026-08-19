@@ -78,7 +78,7 @@ def _get_sent_moments(raw: Any) -> dict[str, str]:
     """
     if not isinstance(raw, dict):
         return {}
-    moments = {}
+    moments: dict[str, str] = {}
     for hashed_key, moment in raw.items():
         try:
             datetime.datetime.fromisoformat(moment)

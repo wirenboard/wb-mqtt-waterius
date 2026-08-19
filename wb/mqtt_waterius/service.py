@@ -102,6 +102,20 @@ def connect_and_wait(client: MQTTClient, timeout: int = CONNECT_TIMEOUT) -> None
 
 
 class Service:  # pylint: disable=too-many-instance-attributes
+    """
+    The daemon itself: schedule, sending, persistent state and the WB devices around them.
+
+    Lives in two threads. The poll loop owns the schedule, the sending and every publish to the
+    status controls, while the paho thread only brings in source readings and switch clicks and
+    hands the rest to the loop through events.
+
+    Args:
+        config: parsed configuration
+        endpoint: Waterius universal API URL
+        datetime_now_fn: source of the current time, injected so tests can freeze or advance it
+        client: MQTT client, injected by the entry points that need their own id and by tests
+    """
+
     def __init__(
         self,
         config: Config,
@@ -218,10 +232,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
         """
         Publish the next-run control.
 
-        Three occasions move it — a (re)connect, which wipes the control, the scheduled minute,
-        which takes the slot to the next allowed day, and the switch, which turns the text into
-        a dash and back. Published at those three points, so nothing has to remember what the
-        broker was given last.
+        Three occasions move it — a (re)connect, which wipes the control, the first schedule
+        pass of the day past the slot, which takes it to the next allowed day, and the switch,
+        which turns the text into a dash and back. Published at those three points, so nothing
+        has to remember what the broker was given last.
         """
         now = self._datetime_now()
         if self._enabled and self._config.devices:
@@ -276,14 +290,11 @@ class Service:  # pylint: disable=too-many-instance-attributes
         by the send itself, which names both the device and the topics.
         """
         topics = self._config.all_topics()
-        missing = [topic for topic in topics if not self._source_values.get(topic)]
-
         for _ in range(int(READINGS_TIMEOUT / READINGS_POLL)):
-            if not missing:
+            if all(self._source_values.get(topic) for topic in topics):
                 return
             if self._stop_event.wait(READINGS_POLL):
                 return
-            missing = [topic for topic in topics if not self._source_values.get(topic)]
 
     def _get_snapshot(self, device: Device) -> tuple[list[ChannelData], list[str]]:
         """
@@ -311,7 +322,8 @@ class Service:  # pylint: disable=too-many-instance-attributes
         """
         Build and log the payload of every configured device without sending anything.
 
-        Nothing outside is touched, not the cloud, not the WB devices, not the saved state.
+        The cloud is not touched, the payloads only reach the log. What the command around this
+        method does touch is listed in run_once.
 
         Returns:
             True when every device had a full set of readings
@@ -505,14 +517,18 @@ class Service:  # pylint: disable=too-many-instance-attributes
         if (now.hour, now.minute) < (self._send_hour, self._send_minute):
             return
         today = now.date().isoformat()
+        # The first pass of the day to get here is the one that finds today's slot behind it,
+        # whether it landed on the exact minute or stepped over it, so the next-run text follows.
+        first_pass_today = self._last_schedule_run is None or self._last_schedule_run[0] != today
         # A reconnect wakes the poll early, so the same minute can come round twice. Without
         # this the slot would fire twice and a failed device would be re-POSTed seconds apart.
         if self._last_schedule_run == (today, now.hour, now.minute):
             return
         self._last_schedule_run = (today, now.hour, now.minute)
+        if first_pass_today:
+            self._publish_next_run()
         if (now.hour, now.minute) == (self._send_hour, self._send_minute):
             self.send_now()
-            self._publish_next_run()  # the slot just moved to the next allowed day
             return
         unsent = self._get_unsent_devices(now)
         if unsent:
@@ -630,6 +646,11 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Waiting for the source values belongs to the send itself, so this only connects,
         subscribes and dispatches. Unlike the daemon it makes a single pass with no retry, so
         a value that has not arrived by then is reported instead of being picked up later.
+
+        The command shares the devices and the state file with the daemon, in both modes. The
+        subscription mirrors the source values onto the key devices, the constructor rewrites
+        the state file when it prunes, and the outcome of a real send lands on the integration
+        device, so a manual send shows up on the card the same way a scheduled one does.
 
         Args:
             dry_run: build and log the payloads instead of posting them

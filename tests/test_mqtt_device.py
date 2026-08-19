@@ -341,6 +341,30 @@ def test_clear_through_the_facade_wipes_the_same_topics() -> None:
     }
 
 
+def test_a_key_device_error_survives_a_reconnect() -> None:
+    # The reconnect wipes the card and recreates it, while the service keeps its verdict in
+    # memory. A device that forgot its error would leave the integration red without a reason.
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.create()
+    devices.mark_device_failed(0, "Key not accepted by Waterius")
+    devices.remove()
+    devices.create()
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == "Key not accepted by Waterius"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == "w"
+
+
+def test_a_successful_send_clears_the_remembered_error() -> None:
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.mark_device_failed(0, "HTTP 500")
+    devices.mark_device_sent(0, "2026-01-01 03:00:00")
+    devices.remove()
+    devices.create()
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == ""
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == ""
+
+
 def test_remove_empties_everything_create_published() -> None:
     # A clean stop must leave nothing behind, so the removal list has to cover the whole device.
     client = FakeClient()

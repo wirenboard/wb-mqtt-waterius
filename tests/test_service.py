@@ -438,6 +438,34 @@ def test_a_reconnect_republishes_the_status(monkeypatch: pytest.MonkeyPatch) -> 
     assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Thursday 2026-07-16 12:00"
 
 
+def test_a_missed_slot_minute_still_moves_next_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A long pass steps over the exact minute. The catch-up sends what has no mark anyway, and
+    # the next-run text has to follow the slot the loop never saw.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, client = _service(
+        config, values={topic: "10"}, now=datetime.datetime(2026, 7, 16, 12, 1)
+    )
+    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance._send_scheduled()
+    assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Friday 2026-07-17 12:00"
+
+
+def test_the_next_run_text_goes_out_once_a_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every later pass of the same day sees the same slot, so the control is left alone.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, client = _service(
+        config, values={topic: "10"}, now=datetime.datetime(2026, 7, 16, 12, 1)
+    )
+    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance._send_scheduled()
+    client.published.clear()
+    service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 16, 12, 2)
+    service_instance._send_scheduled()
+    assert f"{INTEGRATION_BASE}/controls/next_execution" not in [topic for topic, *_ in client.published]
+
+
 def test_the_scheduled_fire_moves_next_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     # The slot has just been used, so the control has to point at the next allowed day. Nothing
     # else would move it before the next reconnect.
@@ -720,6 +748,69 @@ def test_a_restart_resumes_the_device_left_unsent(monkeypatch: pytest.MonkeyPatc
     fail_k2["on"] = False  # K2 recovers while the service was down
     restarted._send_scheduled()
     assert calls == ["K2"]
+
+
+class _FakeSignals:  # pylint: disable=too-few-public-methods
+    """
+    Stand-in for the signal module, so the test runs where SIGHUP does not exist.
+    """
+
+    SIGTERM, SIGINT, SIGHUP = 15, 2, 1
+
+    def __init__(self) -> None:
+        self.handlers: dict[int, Callable] = {}
+
+    def signal(self, signum: int, handler: Callable) -> None:
+        self.handlers[signum] = handler
+
+
+def test_a_source_value_arrives_through_the_client() -> None:
+    # The daemon rests on this wiring: the subscription has to hand incoming values to the
+    # reading callback, or every device reports no data and nothing is ever sent.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, client = _service(config, values={})
+    service_instance._subscribe_readings()
+    client.publish(topic, "12.5")
+    assert service_instance._source_values[topic] == "12.5"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") == "12.5"  # mirrored on the card too
+
+
+def test_the_daemon_stops_on_every_signal_it_takes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # SIGHUP is a stop here, not the config reload the convention suggests, so the whole set is
+    # worth pinning. Each handler has to reach stop_service, which is what ends the poll loop.
+    (tmp_path / "wb.conf").write_text(
+        '{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8"
+    )
+    signals = _FakeSignals()
+    monkeypatch.setattr(service, "signal", signals)
+    started: dict[str, service.Service] = {}
+    monkeypatch.setattr(service.Service, "run", lambda self: started.setdefault("service", self))
+
+    assert service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient()) == service.EXIT_SUCCESS
+    assert set(signals.handlers) == {signals.SIGTERM, signals.SIGINT, signals.SIGHUP}
+    for signum, handler in signals.handlers.items():
+        started["service"]._stop_event.clear()
+        handler(signum, None)
+        assert started["service"]._stop_event.is_set()
+        assert started["service"]._wake_event.is_set()  # the loop wakes instead of sleeping out
+
+
+def test_the_slot_fires_again_the_next_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard remembers the minute it fired in, so it has to remember the day as well —
+    # otherwise a long-lived daemon fires on its first day and never again.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, _ = _service(config, values={topic: "10"})  # NOW is the send minute
+    sent: list[str] = []
+    _patch_send(
+        monkeypatch,
+        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
+    )
+    service_instance._send_scheduled()
+    service_instance._datetime_now = lambda: NOW + datetime.timedelta(days=1)
+    service_instance._send_scheduled()
+    assert sent == ["K1", "K1"]
 
 
 def test_main_daemon_config_error_reports_invalid_state(

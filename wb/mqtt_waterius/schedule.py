@@ -12,9 +12,23 @@ WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 
 def next_run(hour: int, minute: int, days: set[int], now: datetime.datetime) -> Optional[datetime.datetime]:
     """
-    Next hour and minute on an allowed weekday, strictly after `now`.
+    Next occurrence of the given hour and minute on an allowed weekday, strictly after now.
 
-    days — datetime.weekday() indices (Monday=0). Returns None if empty.
+    Args:
+        hour: hour of the send time
+        minute: minute of the send time
+        days: allowed weekdays as datetime.weekday() indices, Monday=0
+        now: moment to search forward from
+
+    Returns:
+        The next moment, or None when no weekday is allowed
+
+    Examples:
+        >>> import datetime
+        >>> next_run(12, 0, {3, 4}, datetime.datetime(2026, 7, 16, 12, 0))
+        datetime.datetime(2026, 7, 17, 12, 0)
+        >>> next_run(12, 0, set(), datetime.datetime(2026, 7, 16, 9, 0)) is None
+        True
     """
     if not days:
         return None

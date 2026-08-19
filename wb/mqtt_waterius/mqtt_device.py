@@ -352,7 +352,7 @@ class _PublishedDevice:
         command that would arrive as a real one. Emptying a topic the broker never held costs
         one publish and nothing else.
         """
-        topics = []
+        topics: list[str] = []
         for control in self._controls:
             topic = self._control_topic(control)
             topics.extend([topic, f"{topic}/meta", f"{topic}/meta/error"])
@@ -374,6 +374,7 @@ class PerKeyDevice(_PublishedDevice):
         self._build_channels()
         # Restored from persistent state, kept current so a reconnect republishes it.
         self._last_sent = last_sent
+        self._last_error = ""  # filled by mark_failed, republished the same way
         super().__init__(
             client,
             base=f"/devices/{build_key_device_id(index)}",
@@ -408,10 +409,11 @@ class PerKeyDevice(_PublishedDevice):
     def _publish_initial_values(self) -> None:
         for control in self._channels:
             self._publish_control(control, "")
-        # Restore the persisted "Last Sent". "Errors" starts empty.
+        # Both come off the instance, so a reconnect brings the card back as it was. The stamp
+        # starts from the state file, the error text lives as long as the process.
         self._publish_control(KEY_LAST_SENT, self._last_sent)
-        self._publish_control(KEY_LAST_ERROR, "")
-        self._set_error(False)
+        self._publish_control(KEY_LAST_ERROR, self._last_error)
+        self._set_error(bool(self._last_error))
 
     def update_channel(self, mqtt_topic: str, raw_value: Optional[str]) -> None:
         """
@@ -443,6 +445,7 @@ class PerKeyDevice(_PublishedDevice):
         The stamp is kept in the instance too, so a reconnect republishes it.
         """
         self._last_sent = timestamp
+        self._last_error = ""
         self._publish_control(KEY_LAST_SENT, timestamp)
         self._publish_control(KEY_LAST_ERROR, "")
         self._set_error(False)
@@ -450,7 +453,11 @@ class PerKeyDevice(_PublishedDevice):
     def mark_failed(self, detail: str) -> None:
         """
         A failed send (API error or unavailable channels): show detail on "Errors".
+
+        The text is kept in the instance for the same reason the stamp is — the clean slate of a
+        reconnect wipes the card, while the service keeps its verdict in memory.
         """
+        self._last_error = detail
         self._publish_control(KEY_LAST_ERROR, detail)
         self._set_error(True)
 
@@ -632,7 +639,7 @@ class WateriusDevices:
         rest of the system.
         """
         self._integration_device.unsubscribe_switch()
-        topics = []
+        topics: list[str] = []
         for key_device in self._key_devices:
             topics.extend(key_device.remove())
         topics.extend(self._integration_device.remove())
