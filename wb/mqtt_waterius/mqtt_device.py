@@ -45,7 +45,7 @@ _DISCOVERY_WILDCARDS = ["/devices/+/meta/#", "/devices/+/controls/+/meta/#"]
 
 # Our own topic, outside the device tree so a scan of our devices cannot pick up its own
 # marker. Published without retain, so the broker keeps nothing.
-_MARKER_TOPIC = "/wb_mqtt_waterius/marker"
+MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 
 # Guard for a broker that answers nothing. It bounds the whole retained burst, not just its
 # first message, so it has room for a large installation.
@@ -190,6 +190,15 @@ def _publish(client: MQTTClient, topic: str, value: str) -> None:
     client.publish(topic, value, retain=True, qos=1)
 
 
+def _wipe_topics(client: MQTTClient, topics: list[str]) -> list[str]:
+    """
+    Publish an empty payload to each topic, which is how a retained topic is removed.
+    """
+    for topic in topics:
+        _publish(client, topic, "")
+    return topics
+
+
 def wait_for_broker(client: MQTTClient, timeout: float = DEFAULT_SCAN_TIMEOUT) -> bool:
     """
     Block until the broker has handled everything published before this call.
@@ -208,12 +217,12 @@ def wait_for_broker(client: MQTTClient, timeout: float = DEFAULT_SCAN_TIMEOUT) -
         if message.payload == marker:
             arrived.set()
 
-    client.message_callback_add(_MARKER_TOPIC, _on_marker)
-    client.subscribe(_MARKER_TOPIC)
-    client.publish(_MARKER_TOPIC, marker, qos=1)
+    client.message_callback_add(MARKER_TOPIC, _on_marker)
+    client.subscribe(MARKER_TOPIC)
+    client.publish(MARKER_TOPIC, marker, qos=1)
     confirmed = arrived.wait(timeout)
-    client.unsubscribe(_MARKER_TOPIC)
-    client.message_callback_remove(_MARKER_TOPIC)
+    client.unsubscribe(MARKER_TOPIC)
+    client.message_callback_remove(MARKER_TOPIC)
     return confirmed
 
 
@@ -282,28 +291,97 @@ def clear_all(client: MQTTClient, timeout: float = DEFAULT_SCAN_TIMEOUT) -> list
     our_device_meta_topics = {f"/devices/{device_id}/meta" for device_id in our_device_ids}
     our_device_topics = _scan_our_device_topics(client, our_device_ids, timeout)
     other_topics = [topic for topic in our_device_topics if topic not in our_device_meta_topics]
-    wiped_topics = other_topics + sorted(our_device_meta_topics)
-    for topic in wiped_topics:
-        _publish(client, topic, "")
-    return wiped_topics
+    return _wipe_topics(client, other_topics + sorted(our_device_meta_topics))
 
 
-class PerKeyDevice:
+class _PublishedDevice:
+    """
+    What both published devices share — the topic layout and the create/remove lifecycle.
+
+    A subclass supplies its base topic, its controls and its title, then fills in the starting
+    values and any topic outside the control list, such as an error flag or a command topic.
+    """
+
+    def __init__(self, client: MQTTClient, *, base: str, controls: list[Control], title: dict) -> None:
+        self._client = client
+        self._base = base
+        self._controls = controls
+        self._title = title
+
+    def _control_topic(self, control: Control) -> str:
+        return f"{self._base}/controls/{control.id}"
+
+    def _publish_control(self, control: Control, value: str) -> None:
+        _publish(self._client, self._control_topic(control), value)
+
+    def _publish_control_meta(self, control: Control) -> None:
+        _publish(self._client, f"{self._control_topic(control)}/meta", json.dumps(control.meta))
+
+    def _set_control_error(self, control: Control, on: bool) -> None:
+        _publish(self._client, f"{self._control_topic(control)}/meta/error", _ERROR_FLAG if on else "")
+
+    def create(self) -> None:
+        """
+        Publish the device: meta for every control, then a starting value for each.
+        """
+        self._publish_meta()
+        self._publish_initial_values()
+
+    def _publish_meta(self) -> None:
+        device_meta = {"driver": DRIVER, "title": self._title}
+        _publish(self._client, f"{self._base}/meta", json.dumps(device_meta))
+        for control in self._controls:
+            self._publish_control_meta(control)
+
+    def _publish_initial_values(self) -> None:
+        raise NotImplementedError
+
+    def remove(self) -> list[str]:
+        """
+        Take this device off the broker, returning the topics emptied.
+        """
+        return _wipe_topics(self._client, self._get_published_topics())
+
+    def _get_published_topics(self) -> list[str]:
+        """
+        Every topic this device publishes, its own ``/meta`` last so an interrupted removal
+        leaves the device discoverable.
+
+        The error flag goes for every control, not only for the one that raises it today, and
+        a writable control takes its command topic along, where the broker can hold a retained
+        command that would arrive as a real one. Emptying a topic the broker never held costs
+        one publish and nothing else.
+        """
+        topics = []
+        for control in self._controls:
+            topic = self._control_topic(control)
+            topics.extend([topic, f"{topic}/meta", f"{topic}/meta/error"])
+            if not control.meta.get("readonly"):
+                topics.append(f"{topic}/on")
+        topics.append(f"{self._base}/meta")
+        return topics
+
+
+class PerKeyDevice(_PublishedDevice):
     """
     One WB device per Waterius key: read-only mirrors of its channels plus its send status.
     """
 
     def __init__(self, client: MQTTClient, index: int, device: Device, last_sent: str = "") -> None:
-        self._client = client
         self._config_device = device
-        self._base = f"/devices/{build_key_device_id(index)}"
         self._channels: list[Control] = []
         self._controls_by_source_topic: dict[str, list[Control]] = {}
+        self._build_channels()
         # Restored from persistent state, kept current so a reconnect republishes it.
         self._last_sent = last_sent
-        self._build_channels()
+        super().__init__(
+            client,
+            base=f"/devices/{build_key_device_id(index)}",
+            controls=self._channels + [KEY_LAST_SENT, KEY_LAST_ERROR],
+            title=self._build_title(),
+        )
 
-    def _title(self) -> dict:
+    def _build_title(self) -> dict:
         # Without a device name, fall back to a masked key prefix — the full key is a write
         # credential and /devices/+/meta is readable by the whole LAN.
         title_suffix = self._config_device.name or mask_key(self._config_device.key)
@@ -326,25 +404,6 @@ class PerKeyDevice:
             control = Control(f"ch{channel_index}", meta)
             self._channels.append(control)
             self._controls_by_source_topic.setdefault(channel.mqtt_topic, []).append(control)
-
-    def _publish_control(self, control: Control, value: str) -> None:
-        _publish(self._client, f"{self._base}/controls/{control.id}", value)
-
-    def _publish_control_meta(self, control: Control) -> None:
-        _publish(self._client, f"{self._base}/controls/{control.id}/meta", json.dumps(control.meta))
-
-    def create(self) -> None:
-        """
-        Publish the device: meta for every control, then a starting value for each.
-        """
-        self._publish_meta()
-        self._publish_initial_values()
-
-    def _publish_meta(self) -> None:
-        device_meta = {"driver": DRIVER, "title": self._title()}
-        _publish(self._client, f"{self._base}/meta", json.dumps(device_meta))
-        for control in self._channels + [KEY_LAST_SENT, KEY_LAST_ERROR]:
-            self._publish_control_meta(control)
 
     def _publish_initial_values(self) -> None:
         for control in self._channels:
@@ -375,9 +434,7 @@ class PerKeyDevice:
         The flag is per-control in WB, and a failed send does not make the channel data
         wrong, so only this control carries it.
         """
-        _publish(
-            self._client, f"{self._base}/controls/{KEY_LAST_ERROR.id}/meta/error", _ERROR_FLAG if on else ""
-        )
+        self._set_control_error(KEY_LAST_ERROR, on)
 
     def mark_sent(self, timestamp: str) -> None:
         """
@@ -398,7 +455,7 @@ class PerKeyDevice:
         self._set_error(True)
 
 
-class IntegrationDevice:
+class IntegrationDevice(_PublishedDevice):
     """
     The control/status device: automatic-sending switch and read-only status.
     """
@@ -406,7 +463,12 @@ class IntegrationDevice:
     def __init__(
         self, client: MQTTClient, on_toggle: Optional[Callable[[bool], None]] = None, version: str = ""
     ) -> None:
-        self._client = client
+        super().__init__(
+            client,
+            base=INTEGRATION_DEVICE_BASE,
+            controls=STATUS_CONTROLS,
+            title={"en": "Waterius Integration", "ru": "Интеграция с Ватериус"},
+        )
         self._on_toggle = on_toggle
         self._version = version
 
@@ -418,32 +480,8 @@ class IntegrationDevice:
         without clearing the flag, the broker raises it and the UI shows the integration red.
         A healthy start wipes the flag along with everything else.
         """
-        topic = f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}/meta/error"
+        topic = f"{self._control_topic(STATUS_STATE)}/meta/error"
         self._client.will_set(topic, _WILL_ERROR_FLAG, retain=True)
-
-    def _publish_control(self, control: Control, value: str) -> None:
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}", value)
-
-    def _publish_control_meta(self, control: Control) -> None:
-        _publish(
-            self._client,
-            f"{INTEGRATION_DEVICE_BASE}/controls/{control.id}/meta",
-            json.dumps(control.meta),
-        )
-
-    def create(self) -> None:
-        """
-        Publish the device: meta for every control, then a starting value for each.
-        """
-        self._publish_meta()
-        self._publish_initial_values()
-
-    def _publish_meta(self) -> None:
-        title = {"en": "Waterius Integration", "ru": "Интеграция с Ватериус"}
-        device_meta = {"driver": DRIVER, "title": title}
-        _publish(self._client, f"{INTEGRATION_DEVICE_BASE}/meta", json.dumps(device_meta))
-        for control in STATUS_CONTROLS:
-            self._publish_control_meta(control)
 
     def _publish_initial_values(self) -> None:
         self.set_state(STATE_INITIALIZING)
@@ -454,7 +492,7 @@ class IntegrationDevice:
         self._publish_control(STATUS_VERSION, self._version)
 
     def _enabled_topic(self) -> str:
-        return f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_ENABLED.id}/on"
+        return f"{self._control_topic(STATUS_ENABLED)}/on"
 
     def subscribe_switch(self) -> None:
         self._client.subscribe(self._enabled_topic())
@@ -498,11 +536,7 @@ class IntegrationDevice:
         """
         Toggle the WB error flag on the state control (non-empty = red in the UI).
         """
-        _publish(
-            self._client,
-            f"{INTEGRATION_DEVICE_BASE}/controls/{STATUS_STATE.id}/meta/error",
-            _ERROR_FLAG if on else "",
-        )
+        self._set_control_error(STATUS_STATE, on)
 
 
 class WateriusDevices:
@@ -588,3 +622,18 @@ class WateriusDevices:
         """
         self._integration_device.unsubscribe_switch()
         return clear_all(self._client, timeout)
+
+    def remove(self) -> list[str]:
+        """
+        Take our devices off the broker on a clean stop, key devices first.
+
+        Unlike ``clear`` this asks the broker for nothing. A stop happens on every config
+        save, and a scan there would pay its timeout just as the broker goes away with the
+        rest of the system.
+        """
+        self._integration_device.unsubscribe_switch()
+        topics = []
+        for key_device in self._key_devices:
+            topics.extend(key_device.remove())
+        topics.extend(self._integration_device.remove())
+        return topics

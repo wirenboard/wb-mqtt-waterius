@@ -7,7 +7,7 @@ import json
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import pytest
 
@@ -45,7 +45,7 @@ def _service(
 ) -> tuple[service.Service, FakeClient]:
     # Seed persisted state read in Service.__init__. stored_state overrides single keys, for the
     # tests that start from a state left by an earlier run.
-    stored = {"enabled": enabled, "schedule_time": None, "last_sent": {}}
+    stored = {"enabled": enabled, "last_sent": {}}
     stored.update(stored_state or {})
     state.save_state(stored)
     client = FakeClient()
@@ -81,17 +81,17 @@ def _patch_send(monkeypatch: pytest.MonkeyPatch, send: Callable[..., Any]) -> No
     monkeypatch.setattr(service, "WateriusClient", lambda endpoint: FakeApi(send))
 
 
-def test_channel_value_coercion() -> None:
+def test_get_channel_value_coercion() -> None:
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
     channel = service_instance._config.devices[0].channels[0]
     service_instance._source_values = {}
-    assert service_instance._channel_value(channel) is None
+    assert service_instance._get_channel_value(channel) is None
     service_instance._source_values = {channel.mqtt_topic: ""}
-    assert service_instance._channel_value(channel) is None
+    assert service_instance._get_channel_value(channel) is None
     service_instance._source_values = {channel.mqtt_topic: "abc"}
-    assert service_instance._channel_value(channel) is None
+    assert service_instance._get_channel_value(channel) is None
     service_instance._source_values = {channel.mqtt_topic: "12.5"}
-    assert service_instance._channel_value(channel) == 12.5
+    assert service_instance._get_channel_value(channel) == 12.5
 
 
 @pytest.mark.parametrize(
@@ -113,25 +113,47 @@ def test_apply_resting_state(
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == expected_flag
 
 
-def test_on_toggle_persists_and_applies_state() -> None:
+def test_on_toggle_persists_and_wakes_the_loop() -> None:
+    # The click arrives on the paho thread, which only records the new position and wakes the
+    # main loop. Publishing from two threads would race over the displayed times.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=True)
     service_instance._on_toggle(False)
     assert state.load_state()["enabled"] is False  # persisted
     assert service_instance._state["enabled"] is False
+    assert service_instance._wake_event.is_set()
+    assert not client.published  # nothing went out from the paho thread
+
+
+def test_the_poll_pass_publishes_the_switch_position() -> None:
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=True)
+    service_instance._on_toggle(False)
+    service_instance._poll_once()
     assert client.last(f"{INTEGRATION_BASE}/controls/enabled") == "0"
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_DISABLED)
 
 
+class _ScheduleCase(NamedTuple):
+    """
+    One row of the schedule table, packed so the test takes a single argument.
+    """
+
+    now: datetime.datetime
+    days_of_week: set[int]
+    enabled: bool
+    sent_today: bool
+    expected: list[str]
+
+
 @pytest.mark.parametrize(
-    "now, days_of_week, enabled, sent_today, expected",
+    "case",
     [
-        (datetime.datetime(2026, 7, 16, 11, 59), ALL_DAYS, True, False, []),
-        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, False, ["K1"]),
-        (datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, True, []),
-        (datetime.datetime(2026, 7, 16, 12, 1), {0}, True, False, []),
-        (NOW, ALL_DAYS, False, False, []),
-        (NOW, ALL_DAYS, True, False, ["K1"]),
-        (NOW, ALL_DAYS, True, True, ["K1"]),
+        _ScheduleCase(datetime.datetime(2026, 7, 16, 11, 59), ALL_DAYS, True, False, []),
+        _ScheduleCase(datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, False, ["K1"]),
+        _ScheduleCase(datetime.datetime(2026, 7, 16, 12, 1), ALL_DAYS, True, True, []),
+        _ScheduleCase(datetime.datetime(2026, 7, 16, 12, 1), {0}, True, False, []),
+        _ScheduleCase(NOW, ALL_DAYS, False, False, []),
+        _ScheduleCase(NOW, ALL_DAYS, True, False, ["K1"]),
+        _ScheduleCase(NOW, ALL_DAYS, True, True, ["K1"]),
     ],
     ids=[
         "before_the_minute",
@@ -143,23 +165,16 @@ def test_on_toggle_persists_and_applies_state() -> None:
         "at_the_minute_sends_even_if_sent_today",
     ],
 )
-def test_send_scheduled(  # pylint: disable=too-many-arguments
-    now: datetime.datetime,
-    days_of_week: set[int],
-    enabled: bool,
-    sent_today: bool,
-    expected: list[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_send_scheduled(case: _ScheduleCase, monkeypatch: pytest.MonkeyPatch) -> None:
     # The schedule rules as a table. Send time is 12:00, today is Thursday, so ALL_DAYS allows
     # today and {0} (Monday) does not. The scheduled minute sends regardless of the marks, past
     # it only a device without today's mark goes out.
+    now, days_of_week, enabled, sent_today, expected = case
     config = _config(Device("K1", [Channel("d/c", 0)]), days_of_week=days_of_week)
     topic = config.devices[0].channels[0].mqtt_topic
     service_instance, _ = _service(config, values={topic: "10"}, enabled=enabled, now=now)
     if sent_today:
-        mark = {"date": NOW.date().isoformat(), "stamp": "Thursday 2026-07-16 12:00"}
-        service_instance._state["last_sent"][state.key_hash("K1")] = mark
+        service_instance._state["last_sent"][state.key_hash("K1")] = NOW.isoformat()
     sent: list[str] = []
     _patch_send(
         monkeypatch,
@@ -190,37 +205,26 @@ def test_send_scheduled_tries_a_failing_device_once_a_minute(monkeypatch: pytest
 
 
 @pytest.mark.parametrize(
-    "config_time, expected_date, expected_sent",
+    "config_time, expected_sent",
     [
-        ("13:00", None, ["K1"]),
-        ("12:00", "2026-07-16", []),
+        ("13:00", ["K1"]),
+        ("12:00", []),
     ],
-    ids=["a_new_time_reopens_the_day", "the_same_time_keeps_the_marks"],
+    ids=["a_later_time_is_a_new_slot", "the_same_time_keeps_it_sent"],
 )
-def test_marks_after_a_restart(
-    config_time: str,
-    expected_date: Optional[str],
-    expected_sent: list[str],
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_moment_is_compared_with_the_slot(
+    config_time: str, expected_sent: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The stored state says the device already sent today, for a 12:00 slot. A config with a new
-    # time is a new slot, so it sends once more, while the same time means a plain restart must not.
+    # The device sent at 12:00 today. Moving the send time to 13:00 puts that moment before the
+    # new slot, so it owes again, while the unchanged 12:00 slot leaves it alone.
     config = Config(config_time, [Device("K1", [Channel("d/c", 0)])], days_of_week=ALL_DAYS)
     topic = config.devices[0].channels[0].mqtt_topic
-    stamp = "Thursday 2026-07-16 12:00"
     service_instance, _ = _service(
         config,
         values={topic: "10"},
         now=datetime.datetime(2026, 7, 16, 13, 5),
-        stored_state={
-            "last_sent": {state.key_hash("K1"): {"date": "2026-07-16", "stamp": stamp}},
-            "schedule_time": "12:00",
-        },
+        stored_state={"last_sent": {state.key_hash("K1"): "2026-07-16T12:00:00"}},
     )
-    mark = service_instance._state["last_sent"][state.key_hash("K1")]
-    assert mark["date"] == expected_date
-    assert mark["stamp"] == stamp  # the card keeps showing the last send either way
-    assert service_instance._state["schedule_time"] == config_time
     sent: list[str] = []
     _patch_send(
         monkeypatch,
@@ -265,7 +269,7 @@ def test_send_now_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_ACTIVE)
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent")  # stamped
-    assert service_instance._state["last_sent"][state.key_hash("K1")]["date"] == NOW.date().isoformat()
+    assert service_instance._state["last_sent"][state.key_hash("K1")] == NOW.isoformat()
 
 
 def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -284,9 +288,9 @@ def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == "w"
     # K1 carries today's mark and K2 does not, so the next poll re-sends K2 alone. That mark is
     # also what a restart reads, the retry does not live in memory.
-    marks = service_instance._state["last_sent"]
-    assert marks[state.key_hash("K1")]["date"] == NOW.date().isoformat()
-    assert state.key_hash("K2") not in marks
+    moments = service_instance._state["last_sent"]
+    assert moments[state.key_hash("K1")] == NOW.isoformat()
+    assert state.key_hash("K2") not in moments
     assert service_instance._failed_transient == {1}  # K2 shown red until it goes through
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error") == "HTTP 503"
     assert client.last(f"{KEY_DEVICE2_BASE}/controls/last_error/meta/error") == "w"
@@ -408,20 +412,41 @@ def test_setup_mqtt_republishes_devices_after_reconnect(monkeypatch: pytest.Monk
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta")  # and its channel
 
 
-def test_next_execution_skips_repeats_but_returns_after_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
-    # "Next Execution" changes once a day, so the minute refresh does not rewrite it. The catch
-    # is the clean slate, it wipes the control and seeds it with NO_TIME, so a memo surviving a
-    # reconnect would leave the card showing "--:--" until the value changes tomorrow.
-    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
-    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])))
-    topic = f"{INTEGRATION_BASE}/controls/next_execution"
-    service_instance._refresh_time_display()
-    assert client.last(topic) == "Friday 2026-07-17 12:00"
+def test_a_quiet_pass_writes_the_clock_only() -> None:
+    # Nothing else changes between two ordinary minutes, so nothing else is rewritten.
+    service_instance, client = _service(
+        _config(Device("K1", [Channel("d/c", 0)])), now=datetime.datetime(2026, 7, 16, 9, 0)
+    )
     client.published.clear()
-    service_instance._refresh_time_display()
-    assert not [entry for entry in client.published if entry[0] == topic]  # same value, no write
-    service_instance._setup_mqtt()
-    assert client.last(topic) == "Friday 2026-07-17 12:00"  # not the NO_TIME the wipe seeded
+    service_instance._poll_once()
+    assert [topic for topic, *_ in client.published] == [f"{INTEGRATION_BASE}/controls/current_time"]
+
+
+def test_a_reconnect_republishes_the_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The clean slate wipes the controls, so the pass that re-created the devices has to fill
+    # them in again — there is no memo left to tell it what the broker is missing.
+    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    service_instance, client = _service(
+        _config(Device("K1", [Channel("d/c", 0)])), now=datetime.datetime(2026, 7, 16, 9, 0)
+    )
+    service_instance._resetup_event.set()
+    client.published.clear()
+    service_instance._poll_once()
+    published = [topic for topic, *_ in client.published]
+    for control in ("enabled", "state", "state/meta/error", "next_execution", "current_time"):
+        assert f"{INTEGRATION_BASE}/controls/{control}" in published
+    assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Thursday 2026-07-16 12:00"
+
+
+def test_the_scheduled_fire_moves_next_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The slot has just been used, so the control has to point at the next allowed day. Nothing
+    # else would move it before the next reconnect.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    topic = config.devices[0].channels[0].mqtt_topic
+    service_instance, client = _service(config, values={topic: "10"})  # NOW is the send minute
+    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance._send_scheduled()
+    assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Friday 2026-07-17 12:00"
 
 
 def test_run_loop_applies_resetup_then_stops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,6 +478,51 @@ def test_run_arms_the_last_will_before_connecting_and_stops_the_client() -> None
     assert client.stopped
 
 
+def test_stop_removes_the_devices_while_the_client_is_still_up() -> None:
+    # Nothing else can take our devices off the broker, the package removal scripts run when the
+    # service is already down. The wipe and its confirmation must go out before the client stops,
+    # paho drops whatever is still on the way.
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    service_instance._stop_event.set()  # one pass through the loop and out
+    service_instance._connected_event.set()
+    service_instance.run()
+    assert client.last(f"{KEY_DEVICE1_BASE}/meta") == ""
+    assert client.last(f"{INTEGRATION_BASE}/meta") == ""
+    before_stop = [topic for topic, *_ in client.published[: client.published_at_stop]]
+    assert f"{INTEGRATION_BASE}/meta" in before_stop
+    assert before_stop[-1] == mqtt_device.MARKER_TOPIC  # the broker confirmed the wipe
+
+
+def test_a_crash_leaves_the_devices_on_the_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Removal belongs to the clean path only. A daemon dying on an exception has to stay visible
+    # and red in the UI, not disappear as if it had been stopped.
+    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    service_instance._setup_mqtt()  # the devices are on the broker
+
+    def boom() -> None:
+        raise RuntimeError("poll blew up")
+
+    monkeypatch.setattr(service_instance, "_poll_once", boom)
+    with pytest.raises(RuntimeError):
+        service_instance.run()
+    assert client.last(f"{KEY_DEVICE1_BASE}/meta")  # still published, not wiped
+    assert client.last(f"{INTEGRATION_BASE}/meta")
+    assert not client.stopped
+
+
+def test_stop_without_a_connection_publishes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Never connected means nothing of ours reached the broker, so there is nothing to remove and
+    # no reason to wait out the confirmation timeout on the way down.
+    monkeypatch.setattr(service, "CONNECT_TIMEOUT", 0)
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    monkeypatch.setattr(client, "start", lambda: None)  # no CONNACK, so no connected event
+    service_instance._stop_event.set()
+    service_instance.run()
+    assert not client.published
+    assert client.stopped
+
+
 def test_send_now_interrupted_leaves_the_rest_unsent(monkeypatch: pytest.MonkeyPatch) -> None:
     # Shutdown landing in the inter-device gap must leave the untouched devices without today's
     # mark, or they are silently skipped until tomorrow.
@@ -470,9 +540,9 @@ def test_send_now_interrupted_leaves_the_rest_unsent(monkeypatch: pytest.MonkeyP
     assert sent == ["K1"]  # only the first device was sent before the abort
     # The mark of the device that DID send is on disk and K2 has none, so K2 is still unsent.
     persisted = state.load_state()["last_sent"]
-    assert persisted[state.key_hash("K1")]["date"] == NOW.date().isoformat()
+    assert persisted[state.key_hash("K1")] == NOW.isoformat()
     assert state.key_hash("K2") not in persisted
-    assert service_instance._get_unsent_devices(NOW.date().isoformat()) == [1]
+    assert service_instance._get_unsent_devices(NOW) == [1]
 
 
 def test_per_device_timestamp_persisted_and_restored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -482,8 +552,8 @@ def test_per_device_timestamp_persisted_and_restored(monkeypatch: pytest.MonkeyP
     _patch_send(monkeypatch, lambda *args, **kwargs: waterius_api.SendResult(True, 200))
     service_instance.send_now()
     digest = state.key_hash("K1")
-    stamp = state.load_state()["last_sent"][digest]["stamp"]
-    assert stamp  # per-device timestamp persisted to the state file
+    stamp = NOW.strftime(service.TIMESTAMP_FORMAT)
+    assert state.load_state()["last_sent"][digest] == NOW.isoformat()  # persisted to the state file
 
     # A fresh Service (same config) restores that timestamp onto the key device.
     client2 = FakeClient()
@@ -521,18 +591,15 @@ def test_timestamp_is_taken_per_device_not_per_batch(monkeypatch: pytest.MonkeyP
 def test_stale_device_timestamps_pruned() -> None:
     stale = state.key_hash("OLD")
     keep = state.key_hash("K1")
-    stale_mark = {"date": "2026-07-15", "stamp": "Wednesday 2026-07-15 10:00"}
-    kept_mark = {"date": "2026-07-16", "stamp": "Thursday 2026-07-16 12:00"}
-    state.save_state(
-        {"enabled": True, "schedule_time": "12:00", "last_sent": {stale: stale_mark, keep: kept_mark}}
-    )
+    kept_moment = "2026-07-16T12:00:00"
+    state.save_state({"enabled": True, "last_sent": {stale: "2026-07-15T10:00:00", keep: kept_moment}})
     config = Config("12:00", [Device("K1", [Channel("d/c", 0)])], days_of_week=ALL_DAYS)
     service_instance = service.Service(
         config, endpoint="http://test", datetime_now_fn=lambda: NOW, client=FakeClient()
     )
     assert keep in service_instance._state["last_sent"]
     assert stale not in service_instance._state["last_sent"]  # dropped on startup
-    assert state.load_state()["last_sent"] == {keep: kept_mark}  # rewritten to disk
+    assert state.load_state()["last_sent"] == {keep: kept_moment}  # rewritten to disk
 
 
 def test_manual_send_ignores_todays_marks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -542,8 +609,7 @@ def test_manual_send_ignores_todays_marks(monkeypatch: pytest.MonkeyPatch) -> No
     topic1 = config.devices[0].channels[0].mqtt_topic
     topic2 = config.devices[1].channels[0].mqtt_topic
     service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
-    mark = {"date": "2026-07-16", "stamp": "Thursday 2026-07-16 08:00"}
-    service_instance._state["last_sent"][state.key_hash("K1")] = mark
+    service_instance._state["last_sent"][state.key_hash("K1")] = "2026-07-16T08:00:00"
     sent = []
     _patch_send(
         monkeypatch,
@@ -574,7 +640,7 @@ def test_send_now_permanent_404_holds_the_device(monkeypatch: pytest.MonkeyPatch
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
     assert service_instance._failed_hold == {1}  # K2 held
     assert service_instance._failed_transient == set()
-    assert not service_instance._get_unsent_devices(NOW.date().isoformat())  # held, not retried today
+    assert not service_instance._get_unsent_devices(NOW)  # held, not retried today
 
 
 def test_catch_up_resends_only_the_unsent_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -728,14 +794,21 @@ def test_main_cleanup_clears_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (f"{INTEGRATION_BASE}/meta", "", True, 1) in client.published  # integration device wiped
 
 
-def test_main_cleanup_survives_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A cleanup that fails (e.g. broker unreachable on uninstall) must still exit 0 so the
-    # package removes cleanly.
+def test_main_cleanup_reports_a_broker_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A broker that is down must not turn a manual cleanup into a traceback, but the exit code
+    # has to say it failed, nobody is coming after this command.
     def boom(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("broker down")
 
     monkeypatch.setattr(service, "clear_all", boom)
-    assert service.main_cleanup(client=FakeClient()) == service.EXIT_SUCCESS
+    assert service.main_cleanup(client=FakeClient()) == service.EXIT_FAILURE
+
+
+def test_main_cleanup_reports_an_unconfirmed_wipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The publishes went out but the broker never confirmed them, so the devices may still be there.
+    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    monkeypatch.setattr(service, "wait_for_broker", lambda *_args, **_kwargs: False)
+    assert service.main_cleanup(client=FakeClient()) == service.EXIT_FAILURE
 
 
 def test_main_cleanup_uses_distinct_client_id(monkeypatch: pytest.MonkeyPatch) -> None:

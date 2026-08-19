@@ -16,12 +16,17 @@ def state_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_state_roundtrip() -> None:
-    mark = {"date": "2026-07-16", "stamp": "Thursday 2026-07-16 12:00"}
-    state.save_state({"enabled": False, "schedule_time": "12:00", "last_sent": {"a1b2c3d4e5f6": mark}})
+    moment = "2026-07-16T12:00:00"
+    state.save_state({"enabled": False, "last_sent": {"a1b2c3d4e5f6": moment}})
     loaded = state.load_state()
     assert loaded["enabled"] is False
-    assert loaded["schedule_time"] == "12:00"
-    assert loaded["last_sent"] == {"a1b2c3d4e5f6": mark}
+    assert loaded["last_sent"] == {"a1b2c3d4e5f6": moment}
+
+
+def test_state_drops_a_moment_it_cannot_read() -> None:
+    # A hand-edited file must not crash the daemon. The device simply counts as never sent.
+    state.save_state({"enabled": True, "last_sent": {"a1b2c3d4e5f6": "вчера"}})
+    assert not state.load_state()["last_sent"]
 
 
 @pytest.mark.parametrize(
@@ -39,7 +44,6 @@ def test_load_state_defaults_on_bad_input(content: Optional[str], tmp_path: Path
         (tmp_path / "state.json").write_text(content)
     loaded = state.load_state()
     assert loaded["enabled"] is True
-    assert loaded["schedule_time"] is None
     assert not loaded["last_sent"]
 
 
@@ -50,6 +54,6 @@ def test_save_state_swallows_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_save_state_atomic_leaves_valid_file_no_tmp(tmp_path: Path) -> None:
-    state.save_state({"enabled": False, "schedule_time": "12:00", "last_sent": {}})
+    state.save_state({"enabled": False, "last_sent": {}})
     assert state.load_state()["enabled"] is False  # complete, valid file
     assert not (tmp_path / "state.json.tmp").exists()  # temp cleaned up by os.replace

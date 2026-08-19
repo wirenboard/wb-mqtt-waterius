@@ -60,7 +60,11 @@ class FakeClient:
         self.on_connect: Optional[Callable] = None
         self.will: Optional[tuple] = None
         self.will_at_connect: Optional[tuple] = None
-        self.stopped = False
+        self.published_at_stop: Optional[int] = None
+
+    @property
+    def stopped(self) -> bool:
+        return self.published_at_stop is not None
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
         self.published.append((topic, payload, retain, qos))
@@ -93,7 +97,8 @@ class FakeClient:
             self.on_connect(self, None, {}, 0)
 
     def stop(self) -> None:
-        self.stopped = True
+        # Real paho cuts off whatever is still on its way out, so remember what got through.
+        self.published_at_stop = len(self.published)
 
     def last(self, topic: str) -> Any:
         for published_topic, payload, _, _ in reversed(self.published):

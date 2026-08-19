@@ -9,7 +9,6 @@ from tests.conftest import ALL_DAYS, FakeClient, Message, topic_matches
 from wb.mqtt_waterius import mqtt_device
 from wb.mqtt_waterius.config import Channel, Config, Device
 
-MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 INTEGRATION_BASE = mqtt_device.INTEGRATION_DEVICE_BASE
 KEY_DEVICE1_BASE = f"/devices/{mqtt_device.build_key_device_id(1)}"
 KEY_DEVICE2_BASE = f"/devices/{mqtt_device.build_key_device_id(2)}"
@@ -42,7 +41,7 @@ class _StaleMarkerClient(_DeliveringClient):  # pylint: disable=too-few-public-m
     """
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
-        if topic == MARKER_TOPIC:
+        if topic == mqtt_device.MARKER_TOPIC:
             payload = b"other-scan"
         super().publish(topic, payload, retain, qos)
 
@@ -323,7 +322,7 @@ def test_clear_all_wipes_our_leftovers_and_spares_foreign_devices() -> None:
 def test_clear_through_the_facade_cannot_toggle_the_switch() -> None:
     # The wipe scans our own devices, so the broker re-delivers a stuck retained command to
     # whatever still listens on it. Without dropping the subscription first, that flips
-    # automatic sending behind the user's back — reproduced on the stand before the fix.
+    # automatic sending behind the user's back.
     command = f"{INTEGRATION_BASE}/controls/enabled/on"
     client = _DeliveringClient({f"{INTEGRATION_BASE}/meta": "{}", command: "0"})
     toggled: list[bool] = []
@@ -340,6 +339,45 @@ def test_clear_through_the_facade_wipes_the_same_topics() -> None:
         f"{KEY_DEVICE1_BASE}/meta",
         f"{INTEGRATION_BASE}/meta",
     }
+
+
+def test_remove_empties_everything_create_published() -> None:
+    # A clean stop must leave nothing behind, so the removal list has to cover the whole device.
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.create()
+    created = {topic for topic, *_ in client.published}
+    client.published.clear()
+    devices.remove()
+    emptied = {topic for topic, payload, *_ in client.published if payload == ""}
+    assert created <= emptied
+
+
+def test_remove_empties_device_meta_after_its_controls() -> None:
+    # An interrupted removal leaves the device discoverable, so a later scan still finds it.
+    removed = _devices(FakeClient(), _single_config()).remove()
+    assert removed.index(f"{KEY_DEVICE1_BASE}/controls/ch0/meta") < removed.index(f"{KEY_DEVICE1_BASE}/meta")
+    assert removed[-1] == f"{INTEGRATION_BASE}/meta"
+
+
+def test_remove_wipes_the_switch_command_topic() -> None:
+    # A retained command outliving us would reach the next start as a command from the user.
+    command = f"{INTEGRATION_BASE}/controls/enabled/on"
+    client = FakeClient()
+    toggled: list[bool] = []
+    devices = _devices(client, _single_config(), on_toggle=toggled.append)
+    devices.subscribe_switch()
+    devices.remove()
+    assert client.last(command) == ""
+    assert command not in client.callbacks  # the subscription went before the wipe
+    assert not toggled
+
+
+def test_remove_asks_the_broker_for_nothing() -> None:
+    # Unlike clear(), the stop path knows its own topics and must not pay a scan timeout.
+    client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
+    _devices(client, _single_config()).remove()
+    assert not client.subscribed
 
 
 def test_mark_device_out_of_range_is_a_no_op() -> None:
@@ -377,7 +415,7 @@ def test_integration_status_controls_carry_meta_and_a_startup_state() -> None:
 def test_wait_for_broker_confirms_when_its_token_returns() -> None:
     client = FakeClient()
     assert mqtt_device.wait_for_broker(client, timeout=1) is True
-    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
+    assert mqtt_device.MARKER_TOPIC in [topic for topic, *_ in client.published]
 
 
 def test_wait_for_broker_reports_an_unconfirmed_wait() -> None:
@@ -390,7 +428,7 @@ def test_scan_ends_on_its_own_marker_and_not_on_the_timeout() -> None:
     started = time.monotonic()
     mqtt_device.clear_all(client, timeout=30)
     assert time.monotonic() - started < 1
-    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
+    assert mqtt_device.MARKER_TOPIC in [topic for topic, *_ in client.published]
 
 
 def test_scan_falls_back_to_the_timeout_when_the_marker_is_not_ours() -> None:

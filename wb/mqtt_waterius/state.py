@@ -2,16 +2,16 @@
 Persistent runtime state for wb-mqtt-waterius.
 
 A single JSON file under /var/lib that survives a restart of the service and of the broker.
-It holds the automatic-sending switch, the time the marks below were made for, and a mark per
-device — the day it last sent and the stamp its card shows. Reading and writing is all this
-module does, the rules around the values live in the service.
+It holds the automatic-sending switch and, per device, the moment of its last successful send.
+Reading and writing is all this module does, the rules around the values live in the service.
 """
 
+import datetime
 import hashlib
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, TypedDict
 
 STATE_DIR = "/var/lib/wb-mqtt-waterius"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -19,11 +19,24 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 logger = logging.getLogger(__name__)
 
 
+class State(TypedDict):
+    """
+    Contents of state.json.
+
+    Attributes:
+        enabled: automatic sending on or off
+        last_sent: ISO moment of the last successful send per device, keyed by key_hash
+    """
+
+    enabled: bool
+    last_sent: dict[str, str]
+
+
 def key_hash(key: str) -> str:
     """
     Stable, non-reversible id for a device key.
 
-    Used as the map key of the per-device timestamps, so the key itself is not copied into
+    Used as the map key of the per-device moments, so the key itself is not copied into
     the state file.
 
     Args:
@@ -35,17 +48,12 @@ def key_hash(key: str) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:12]
 
 
-def load_state() -> dict:
+def load_state() -> State:
     """
     Load the persistent runtime state, falling back to safe defaults.
 
-    - ``enabled`` — automatic sending on or off.
-    - ``schedule_time`` — the time the marks below were made for. A changed time counts as a
-      new slot, so the marks are dropped and the day sends once more.
-    - ``last_sent`` — per-device ``{"date", "stamp"}``, keyed by a hash of the device key.
-      The date says who already sent today, so a restart resumes instead of losing the day.
-      The stamp is what the device card shows. Marks of devices dropped from the config are
-      removed by the service on startup.
+    A device without a moment counts as never sent, so the worst a missing or broken file can
+    do is one extra send. The service drops the moments of devices gone from the config.
     """
     try:
         with open(STATE_FILE, encoding="utf-8") as handle:
@@ -56,31 +64,31 @@ def load_state() -> dict:
         data = {}
     return {
         "enabled": bool(data.get("enabled", True)),
-        "schedule_time": data.get("schedule_time"),
-        "last_sent": _get_device_marks(data.get("last_sent")),
+        "last_sent": _get_sent_moments(data.get("last_sent")),
     }
 
 
-def _get_device_marks(raw: Any) -> dict:
+def _get_sent_moments(raw: Any) -> dict[str, str]:
     """
-    Keep the well-formed marks and drop the rest, a hand-edited file must not crash the daemon.
+    Keep the entries that read as an ISO moment and drop the rest.
 
     Examples:
-        >>> _get_device_marks({"a1b2": {"date": "2026-08-18", "stamp": "Tuesday 2026-08-18 03:00"}})
-        {'a1b2': {'date': '2026-08-18', 'stamp': 'Tuesday 2026-08-18 03:00'}}
-        >>> _get_device_marks({"a1b2": "Tuesday 2026-08-18 03:00"})
-        {}
+        >>> _get_sent_moments({"a1b2": "2026-08-18T03:00:00", "c3d4": "yesterday"})
+        {'a1b2': '2026-08-18T03:00:00'}
     """
     if not isinstance(raw, dict):
         return {}
-    return {
-        hashed_key: {"date": mark.get("date"), "stamp": mark.get("stamp", "")}
-        for hashed_key, mark in raw.items()
-        if isinstance(mark, dict)
-    }
+    moments = {}
+    for hashed_key, moment in raw.items():
+        try:
+            datetime.datetime.fromisoformat(moment)
+        except (TypeError, ValueError):
+            continue
+        moments[hashed_key] = moment
+    return moments
 
 
-def save_state(state: dict) -> None:
+def save_state(state: State) -> None:
     """
     Write the state atomically.
 

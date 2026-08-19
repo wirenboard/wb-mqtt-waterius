@@ -64,10 +64,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     send_parser.add_argument(
         "--dry-run", action="store_true", help="build and print payloads without sending"
     )
-    subparsers.add_parser("cleanup", help="remove all Waterius devices from MQTT (used on uninstall)")
+    subparsers.add_parser("cleanup", help="remove all Waterius devices from MQTT")
 
-    args = parser.parse_args(argv)
     _setup_logging()
+    args = parser.parse_args(argv)
     if args.command == "daemon":
         return main_daemon(args.config)
     if args.command == "send":

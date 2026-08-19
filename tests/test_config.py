@@ -21,7 +21,7 @@ def test_parse_valid_config() -> None:
     cfg = config.parse_config(_valid_config())
     assert cfg.send_hour_minute == (3, 30)
     assert len(cfg.devices) == 1
-    assert cfg.devices[0].channels[0].topic == "waterius-demo/cold_water"
+    assert cfg.devices[0].channels[0].source == "waterius-demo/cold_water"
 
 
 def test_device_name_is_parsed_and_trimmed() -> None:

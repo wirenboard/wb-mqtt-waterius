@@ -73,8 +73,8 @@ def test_build_payload_rejects_channel_without_value() -> None:
     # not built either. The message names the device by its masked key and the channel by
     # its topic, so the journal shows which device and which reading is missing.
     channels = [
-        waterius_api.ChannelReading("d/a", 0, None),
-        waterius_api.ChannelReading("d/b", 1, 0.2),
+        waterius_api.ChannelData("d/a", 0, None),
+        waterius_api.ChannelData("d/b", 1, 0.2),
     ]
     with pytest.raises(ValueError, match="device 01234: channel d/a"):
         waterius_api.build_payload("0123456789abcdef0123456789abcdef", "Boiler", channels)

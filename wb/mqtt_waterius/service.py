@@ -28,12 +28,12 @@ from wb.mqtt_waterius.mqtt_device import (
     wait_for_broker,
 )
 from wb.mqtt_waterius.schedule import format_datetime, next_run
-from wb.mqtt_waterius.state import key_hash, load_state, save_state
+from wb.mqtt_waterius.state import State, key_hash, load_state, save_state
 from wb.mqtt_waterius.version import get_version
 from wb.mqtt_waterius.waterius_api import (
     DEFAULT_ENDPOINT,
     KEY_NOT_FOUND_CODE,
-    ChannelReading,
+    ChannelData,
     WateriusClient,
     build_payload,
     mask_key,
@@ -62,6 +62,20 @@ EXIT_FAILURE = 1
 EXIT_CONFIG_ERROR = 6
 
 logger = logging.getLogger(__name__)
+
+
+def _display_stamp(moment: Optional[str]) -> str:
+    """
+    Format a stored moment for the Last Sent control, empty string when there is none.
+    """
+    return datetime.datetime.fromisoformat(moment).strftime(TIMESTAMP_FORMAT) if moment else ""
+
+
+def _sent_before(moment: Optional[str], slot: datetime.datetime) -> bool:
+    """
+    Whether a device is missing its moment or last sent before the given one.
+    """
+    return not moment or datetime.datetime.fromisoformat(moment) < slot
 
 
 def _wait_connected(connected_event: threading.Event, timeout: int) -> None:
@@ -110,17 +124,16 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()  # set once the first CONNACK arrives
         self._resetup_event = threading.Event()  # set on every (re)connect, re-publish devices
+        self._toggle_event = threading.Event()  # set by the switch, the loop republishes the status
         self._wake_event = threading.Event()  # interrupts the poll sleep (reconnect or stop)
 
         self._source_values: dict[str, str] = {}  # mqtt topic -> raw string payload
         self._failed_transient: set[int] = set()  # device indices that failed their last attempt
         self._failed_hold: set[int] = set()  # device indices errored but not retried (404 or gave up)
         self._last_schedule_run: Optional[tuple[str, int, int]] = None  # (date, hour, minute) already run
-        self._last_next_run: Optional[str] = None  # last published "Next Execution", skips repeats
 
-        self._state = load_state()
-        self._reset_marks_if_time_changed()
-        stamps = self._prune_device_marks()
+        self._state: State = load_state()
+        stamps = self._prune_sent_moments()
         self._enabled = self._state["enabled"]
 
         # client is injectable for tests and for the entry points that need a distinct id
@@ -134,40 +147,24 @@ class Service:  # pylint: disable=too-many-instance-attributes
             last_sent=stamps,
         )
 
-    def _reset_marks_if_time_changed(self) -> None:
+    def _prune_sent_moments(self) -> list[str]:
         """
-        A new scheduled time is a new slot, so nobody counts as sent for today any more.
+        Drop the moments of devices no longer in the config, then persist what is left.
 
-        This matters in one case only, when the new time has already passed today and today
-        was already sent. Without the reset that edit would take effect tomorrow. The stamps
-        stay, they are what the cards show.
-        """
-        if self._state["schedule_time"] == self._config.send_time:
-            return
-        cleared = {
-            hashed_key: {"date": None, "stamp": mark["stamp"]}
-            for hashed_key, mark in self._state["last_sent"].items()
-        }
-        self._save_state_values(last_sent=cleared, schedule_time=self._config.send_time)
-
-    def _prune_device_marks(self) -> list[str]:
-        """
-        Drop the marks of devices no longer in the config, then persist what is left.
-
-        Runs on startup, and a config edit restarts the service, so a key removed from the
-        configurator takes its mark out of the state file with it.
+        A config edit restarts the service, so a key removed in the configurator takes its
+        moment out of the state file with it.
 
         Returns:
-            Stamps of the configured devices in config order, empty for a device with none
+            Display stamps of the configured devices in config order, empty where none
         """
         key_hashes = [key_hash(device.key) for device in self._config.devices]
         kept = {
-            hashed_key: mark
-            for hashed_key, mark in self._state["last_sent"].items()
+            hashed_key: moment
+            for hashed_key, moment in self._state["last_sent"].items()
             if hashed_key in key_hashes
         }
         self._save_state_values(last_sent=kept)
-        return [kept.get(hashed_key, {}).get("stamp", "") for hashed_key in key_hashes]
+        return [_display_stamp(kept.get(hashed_key)) for hashed_key in key_hashes]
 
     def _apply_resting_state(self) -> None:
         """
@@ -199,34 +196,51 @@ class Service:  # pylint: disable=too-many-instance-attributes
             save_state(self._state)
 
     def _on_toggle(self, enabled: bool) -> None:
-        # Runs on the paho thread, the write goes through the lock.
+        """
+        Take the switch position, on the paho thread.
+
+        Records it, persists it and wakes the poll loop, which publishes what the switch
+        changed. Nothing goes out from here, the poll pass is the only writer of those controls.
+        """
         self._enabled = enabled
         self._save_state_values(enabled=enabled)
-        self._wb_devices.set_enabled(enabled)
-        self._apply_resting_state()
-        self._refresh_time_display()
         logger.info("Automatic sending %s", "enabled" if enabled else "disabled")
+        self._toggle_event.set()
+        self._wake_event.set()
 
-    def _refresh_time_display(self) -> None:
+    def _publish_current_time(self) -> None:
         """
-        Refresh the two clock controls of the integration device.
+        Publish the clock control. Its value changes every minute, so it goes out every pass.
+        """
+        self._wb_devices.set_current_time(format_datetime(self._datetime_now()))
 
-        The next-run text changes once a day at most, so it goes out only when it differs from
-        the one published last, instead of 1440 identical writes. The clean slate in
-        _setup_mqtt wipes the control, so it clears the memo as well.
+    def _publish_next_run(self) -> None:
+        """
+        Publish the next-run control.
+
+        Three occasions move it — a (re)connect, which wipes the control, the scheduled minute,
+        which takes the slot to the next allowed day, and the switch, which turns the text into
+        a dash and back. Published at those three points, so nothing has to remember what the
+        broker was given last.
         """
         now = self._datetime_now()
-        self._wb_devices.set_current_time(format_datetime(now))
-
         if self._enabled and self._config.devices:
             next_dt = next_run(self._send_hour, self._send_minute, self._config.days_of_week, now)
             next_text = format_datetime(next_dt) if next_dt else NO_TIME
         else:
             next_text = NO_TIME
+        self._wb_devices.set_next_run(next_text)
 
-        if next_text != self._last_next_run:
-            self._wb_devices.set_next_run(next_text)
-            self._last_next_run = next_text
+    def _publish_status(self) -> None:
+        """
+        Publish everything on the integration device except the clock.
+
+        The switch position, the state with its error flag and the next-run text. Called after a
+        (re)connect, which wipes them, and after a switch click, which changes all three.
+        """
+        self._wb_devices.set_enabled(self._enabled)
+        self._update_integration_error()
+        self._publish_next_run()
 
     def _on_reading(self, _client: MQTTClient, _userdata: Any, message: Any) -> None:
         raw = message.payload.decode(errors="replace")
@@ -238,11 +252,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
             self._client.subscribe(topic)
             self._client.message_callback_add(topic, self._on_reading)
 
-    def _channel_value(self, channel: Channel) -> Optional[float]:
+    def _get_channel_value(self, channel: Channel) -> Optional[float]:
         raw = self._source_values.get(channel.mqtt_topic)
 
         if raw is None or raw == "":
-            logger.warning("No value yet for %s", channel.mqtt_topic)
             return None
         try:
             return float(raw)
@@ -272,7 +285,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
                 return
             missing = [topic for topic in topics if not self._source_values.get(topic)]
 
-    def _get_snapshot(self, device: Device) -> tuple[list[ChannelReading], list[str]]:
+    def _get_snapshot(self, device: Device) -> tuple[list[ChannelData], list[str]]:
         """
         Read every channel of one device once.
 
@@ -288,11 +301,11 @@ class Service:  # pylint: disable=too-many-instance-attributes
             Waterius maps values by channel number and a device with a gap would arrive with
             the remaining values shifted onto the wrong meters.
         """
-        values = [(channel, self._channel_value(channel)) for channel in device.channels]
-        missing = [channel.topic for channel, value in values if value is None]
+        values = [(channel, self._get_channel_value(channel)) for channel in device.channels]
+        missing = [channel.source for channel, value in values if value is None]
         if missing:
             return [], missing
-        return [ChannelReading(ch.topic, ch.data_type, value, ch.serial) for ch, value in values], []
+        return [ChannelData(ch.source, ch.data_type, value, ch.serial) for ch, value in values], []
 
     def dry_run_payloads(self) -> bool:
         """
@@ -351,10 +364,9 @@ class Service:  # pylint: disable=too-many-instance-attributes
             # Stamped when this device answered, not when the batch started, because devices
             # are sent one at a time and a retried one answers minutes later.
             now = self._datetime_now()
-            timestamp = now.strftime(TIMESTAMP_FORMAT)
-            self._wb_devices.mark_device_sent(index, timestamp)
-            mark = {"date": now.date().isoformat(), "stamp": timestamp}
-            self._save_state_values(last_sent={**self._state["last_sent"], key_hash(device.key): mark})
+            self._wb_devices.mark_device_sent(index, now.strftime(TIMESTAMP_FORMAT))
+            moment = now.isoformat(timespec="seconds")
+            self._save_state_values(last_sent={**self._state["last_sent"], key_hash(device.key): moment})
             return SEND_OK
 
         self._wb_devices.mark_device_failed(index, result.error or f"HTTP {result.status_code}")
@@ -440,23 +452,25 @@ class Service:  # pylint: disable=too-many-instance-attributes
                 return False
             return not (pending or held)
 
-    def _get_unsent_devices(self, today: str) -> list[int]:
+    def _get_unsent_devices(self, now: datetime.datetime) -> list[int]:
         """
-        Devices with no successful send today, in config order.
+        Devices that have not sent since today's scheduled minute, in config order.
 
         This is the whole retry mechanism. A device that failed, one whose value had not
         arrived yet and one that was never tried because the service was down all look the
-        same here, so a restart resumes the day instead of losing it. Devices held after a
-        404 stay out, retrying an unregistered key today is pointless.
+        same here, so a restart resumes the day instead of losing it. A later send time makes
+        every device unsent by itself, nothing has to be reset. Devices held after a 404 stay
+        out, retrying an unregistered key today is pointless.
 
         Args:
-            today: current date as an ISO string, the device marks are compared against it
+            now: current moment, its date sets the slot the moments are compared against
         """
-        marks = self._state["last_sent"]
+        slot = now.replace(hour=self._send_hour, minute=self._send_minute, second=0, microsecond=0)
+        moments = self._state["last_sent"]
         return [
             index
             for index, device in enumerate(self._config.devices)
-            if index not in self._failed_hold and marks.get(key_hash(device.key), {}).get("date") != today
+            if index not in self._failed_hold and _sent_before(moments.get(key_hash(device.key)), slot)
         ]
 
     def _update_integration_error(self) -> None:
@@ -498,8 +512,9 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._last_schedule_run = (today, now.hour, now.minute)
         if (now.hour, now.minute) == (self._send_hour, self._send_minute):
             self.send_now()
+            self._publish_next_run()  # the slot just moved to the next allowed day
             return
-        unsent = self._get_unsent_devices(today)
+        unsent = self._get_unsent_devices(now)
         if unsent:
             self._send_batch(unsent)
 
@@ -527,16 +542,13 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
         Runs from the main thread, so the retained scan inside clear() works while the
         network loop keeps delivering messages. Clean-slate, our retained devices are wiped
-        and then recreated from the config.
+        and then recreated from the config. Seeding the values is not its job, the poll pass
+        that called it publishes them right after.
         """
         self._wb_devices.clear()
         self._wb_devices.create()
         self._wb_devices.subscribe_switch()
         self._subscribe_readings()
-        self._wb_devices.set_enabled(self._enabled)
-        self._last_next_run = None  # the clean slate wiped the control, so publish it again
-        self._refresh_time_display()
-        self._apply_resting_state()
 
     def _log_startup(self) -> None:
         if not self._config.devices:
@@ -551,16 +563,24 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
     def _poll_once(self) -> None:
         """
-        One pass of the poll loop, once a minute and right after a (re)connect.
+        One pass of the poll loop, once a minute and right after a (re)connect or a click.
 
-        The MQTT setup is repeated only when a connect asked for it, not on every pass. Then
-        the displayed times are refreshed, and then the schedule decides what to send.
+        The MQTT setup is repeated only when a connect asked for it, and the status controls
+        go out with it, because the clean slate wiped them. A switch click asks for the same
+        republish through its event, so nothing is published from the paho thread. The clock is
+        the only control written on every pass, and then the schedule decides what to send.
         """
         if self._resetup_event.is_set():
             self._resetup_event.clear()
+            self._toggle_event.clear()  # the status goes out right below
             self._setup_mqtt()
+            self._publish_status()
 
-        self._refresh_time_display()
+        if self._toggle_event.is_set():
+            self._toggle_event.clear()
+            self._publish_status()
+
+        self._publish_current_time()
 
         self._send_scheduled()
 
@@ -577,10 +597,27 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
         while not self._stop_event.is_set():
             self._poll_once()
-            self._wake_event.wait(POLL_INTERVAL)  # wakes early on reconnect or stop
+            self._wake_event.wait(POLL_INTERVAL)  # wakes early on a reconnect, a click or a stop
             self._wake_event.clear()
 
+        self._remove_devices()
         self._client.stop()
+
+    def _remove_devices(self) -> None:
+        """
+        Take our devices off the broker, the last thing a clean stop does.
+
+        Nothing else can, the package scripts run when the service is already down. Only on
+        the clean path, a crash has to leave the devices and their error flag up.
+        """
+        if not self._connected_event.is_set():
+            return  # never connected, so nothing of ours reached the broker
+        try:
+            removed = self._wb_devices.remove()
+            if not wait_for_broker(self._client):
+                logger.warning("Broker did not confirm removing %d topics", len(removed))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Could not remove the devices: %s", exc)
 
     def stop_service(self) -> None:
         self._stop_event.set()
@@ -674,19 +711,25 @@ def main_send_once(
 
 def main_cleanup(client: Optional[MQTTClient] = None) -> int:
     """
-    Remove the integration device and every key device from the broker. Used on removal.
+    Remove the integration device and every key device from the broker.
+
+    Scans the broker for our device ids, empties what it finds under them and waits for the
+    confirmation. Run by hand after a service killed without a clean stop, the only way our
+    devices are left behind. Ids come from the scan because the config may no longer describe
+    them, which is also why a stop, knowing what it created, does not scan.
     """
     client = client or MQTTClient(f"{CLIENT_ID}-cleanup")
     try:
         connect_and_wait(client)
         wiped_topics = clear_all(client)
-        # Nothing will retry after an uninstall, so make the broker confirm the wipe.
+        # Nothing retries after this command, so make the broker confirm the wipe.
         confirmed = wait_for_broker(client)
         client.stop()
-        if confirmed:
-            logger.info("Waterius devices cleared, %d topics", len(wiped_topics))
-        else:
-            logger.warning("Broker did not confirm clearing %d topics", len(wiped_topics))
     except Exception as exc:  # pylint:disable=broad-except
-        logger.warning("Cleanup failed: %s", exc)
+        logger.error("Cleanup failed: %s", exc)
+        return EXIT_FAILURE
+    if not confirmed:
+        logger.warning("Broker did not confirm clearing %d topics", len(wiped_topics))
+        return EXIT_FAILURE
+    logger.info("Waterius devices cleared, %d topics", len(wiped_topics))
     return EXIT_SUCCESS
