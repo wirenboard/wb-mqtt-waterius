@@ -30,7 +30,11 @@ RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 KEY_NOT_FOUND_CODE = 404
 KEY_NOT_FOUND_ERROR = "Key not accepted by Waterius"
 
-log = logging.getLogger(__name__)
+# The body of a rejected request names the offending fields. Trimmed to stay readable in
+# a UI control.
+MAX_ERROR_LENGTH = 100
+
+logger = logging.getLogger(__name__)
 
 
 def mask_key(key: str) -> str:
@@ -54,18 +58,18 @@ def mask_key(key: str) -> str:
 
 
 @dataclass(frozen=True)
-class ChannelReading:
+class ChannelData:
     """
-    One meter reading, as the payload builder expects it.
+    One channel of the payload — its reading, meter type and serial number.
 
     Attributes:
-        topic: source MQTT topic, names the channel in error messages
+        source: source control as `<device>/<control>`, names the channel in error messages
         data_type: Waterius data-type code, becomes data_type<N> in the body
         value: the reading itself, None when the value has not arrived yet
         serial: meter serial number, becomes serial<N> when set
     """
 
-    topic: str
+    source: str
     data_type: int
     value: Optional[float]
     serial: Optional[str] = None
@@ -92,7 +96,7 @@ class SendResult:
         return f"SendResult(failed, http={self.status_code}, error={self.error!r})"
 
 
-def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[str, object]:
+def build_payload(key: str, name: str, channels: list[ChannelData]) -> dict[str, object]:
     """
     Build the JSON body for one Waterius device.
 
@@ -114,24 +118,47 @@ def build_payload(key: str, name: str, channels: list[ChannelReading]) -> dict[s
         ValueError: a channel has no value
 
     Examples:
-        >>> build_payload("KEY", "Boiler", [ChannelReading("d/c", 0, 0.1)])
+        >>> build_payload("KEY", "Boiler", [ChannelData("d/c", 0, 0.1)])
         {'key': 'KEY', 'name': 'Boiler', 'ch0': 0.1, 'data_type0': 0}
 
         An empty name keeps the name in the cabinet, and a channel serial is optional.
 
-        >>> build_payload("K", "", [ChannelReading("d/a", 0, 0.1, "1001"),
-        ...                         ChannelReading("d/b", 1, 0.2)])
+        >>> build_payload("K", "", [ChannelData("d/a", 0, 0.1, "1001"),
+        ...                         ChannelData("d/b", 1, 0.2)])
         {'key': 'K', 'name': '', 'ch0': 0.1, 'data_type0': 0, 'serial0': '1001', 'ch1': 0.2, 'data_type1': 1}
     """
     payload: dict[str, object] = {"key": key, "name": name}
     for index, channel in enumerate(channels):
         if channel.value is None:
-            raise ValueError(f"device {mask_key(key)}: channel {channel.topic} has no value")
+            raise ValueError(f"device {mask_key(key)}: channel {channel.source} has no value")
         payload[f"ch{index}"] = channel.value
         payload[f"data_type{index}"] = channel.data_type
         if channel.serial:
             payload[f"serial{index}"] = str(channel.serial)
     return payload
+
+
+def _response_error(response: requests.Response) -> Optional[str]:
+    """
+    Failure reason from the body of a rejected response, None when the body says nothing.
+
+    Examples:
+        >>> class _Rejected:  # stands in for requests.Response
+        ...     text = '["Incorrect fields: serial0"]'
+        ...     def json(self):
+        ...         return ["Incorrect fields: serial0"]
+        >>> _response_error(_Rejected())
+        'Incorrect fields: serial0'
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None  # an error page of the proxy in front of Waterius, not an explanation
+    if isinstance(body, list):
+        body = ", ".join(str(item) for item in body)
+    elif not isinstance(body, str):
+        body = response.text
+    return body.strip()[:MAX_ERROR_LENGTH] or None
 
 
 class WateriusClient:
@@ -140,7 +167,7 @@ class WateriusClient:
 
     Owns one requests session, so devices sent one after another reuse the connection
     instead of a TLS handshake per key. Use as a context manager, one client per send
-    cycle: the session it owns lives and dies with it.
+    batch, the session it owns lives and dies with it.
 
     Args:
         endpoint: Waterius universal API URL
@@ -186,8 +213,9 @@ class WateriusClient:
         POST one device's readings to Waterius.
 
         Never raises on a transport failure. Transient ones (nginx 503, 429/502/504, network
-        errors) are retried with a linear backoff. A non-retryable HTTP error returns at once,
-        and a 404 means the key is not registered (invalid or revoked).
+        errors) are retried with a linear backoff. A non-retryable HTTP error returns at once
+        with the server's own explanation, and a 404 means the key is not registered (invalid
+        or revoked).
 
         Args:
             payload: request body from build_payload
@@ -212,17 +240,20 @@ class WateriusClient:
                     timeout=self.timeout,
                 )
             except requests.RequestException as exc:
-                log.warning("Send failed (attempt %d/%d): %s", attempt, max_attempts, exc)
+                logger.warning("Send failed (attempt %d/%d): %s", attempt, max_attempts, exc)
                 last_failure = SendResult(ok=False, error=str(exc))
             else:
                 if 200 <= response.status_code < 300:
                     return SendResult(ok=True, status_code=response.status_code)
                 if response.status_code not in RETRYABLE_STATUS_CODES:
-                    error = KEY_NOT_FOUND_ERROR if response.status_code == KEY_NOT_FOUND_CODE else None
-                    log.error("Waterius returned HTTP %s: %s", response.status_code, response.text[:200])
+                    if response.status_code == KEY_NOT_FOUND_CODE:
+                        error = KEY_NOT_FOUND_ERROR
+                    else:
+                        error = _response_error(response)
+                    logger.error("Waterius returned HTTP %s: %s", response.status_code, response.text[:200])
                     return SendResult(ok=False, status_code=response.status_code, error=error)
                 last_failure = SendResult(ok=False, status_code=response.status_code)
-                log.warning(
+                logger.warning(
                     "Waterius HTTP %s (attempt %d/%d), retrying", response.status_code, attempt, max_attempts
                 )
             if attempt == max_attempts:

@@ -9,7 +9,6 @@ from tests.conftest import ALL_DAYS, FakeClient, Message, topic_matches
 from wb.mqtt_waterius import mqtt_device
 from wb.mqtt_waterius.config import Channel, Config, Device
 
-MARKER_TOPIC = "/wb_mqtt_waterius/marker"
 INTEGRATION_BASE = mqtt_device.INTEGRATION_DEVICE_BASE
 KEY_DEVICE1_BASE = f"/devices/{mqtt_device.build_key_device_id(1)}"
 KEY_DEVICE2_BASE = f"/devices/{mqtt_device.build_key_device_id(2)}"
@@ -42,7 +41,7 @@ class _StaleMarkerClient(_DeliveringClient):  # pylint: disable=too-few-public-m
     """
 
     def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
-        if topic == MARKER_TOPIC:
+        if topic == mqtt_device.MARKER_TOPIC:
             payload = b"other-scan"
         super().publish(topic, payload, retain, qos)
 
@@ -55,10 +54,12 @@ def _devices(
     return mqtt_device.WateriusDevices(client, on_toggle=on_toggle, config=config, version="1.0.0")
 
 
+def _config(*devices: Device) -> Config:
+    return Config("03:00", list(devices), days_of_week=ALL_DAYS)
+
+
 def _single_config() -> Config:
-    return Config(
-        "03:00", [Device("K1", [Channel("dev/cold", 0), Channel("dev/elec", 2)])], days_of_week=ALL_DAYS
-    )
+    return _config(Device("K1", [Channel("dev/cold", 0), Channel("dev/elec", 2)]))
 
 
 def test_integration_meta_title_and_version() -> None:
@@ -79,6 +80,14 @@ def test_integration_error_flag_toggle() -> None:
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
     devices.set_integration_error(False)
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
+
+
+def test_last_will_targets_the_state_control() -> None:
+    # The broker publishes it if the daemon dies without a clean disconnect. A dead daemon
+    # neither reads nor writes, so the flag says more than a live send failure would.
+    client = FakeClient()
+    _devices(client, _single_config()).set_last_will()
+    assert client.will == (f"{INTEGRATION_BASE}/controls/state/meta/error", "rw", True)
 
 
 def test_set_enabled_and_state_setters() -> None:
@@ -105,7 +114,7 @@ def test_enable_toggle_callback_fires() -> None:
     client = FakeClient()
     toggled = []
     devices = _devices(client, _single_config(), on_toggle=toggled.append)
-    devices.subscribe()
+    devices.subscribe_switch()
     on_enabled = client.callbacks[f"{INTEGRATION_BASE}/controls/enabled/on"]
     on_enabled(None, None, Message("0"))
     on_enabled(None, None, Message("1"))
@@ -124,11 +133,7 @@ def test_mark_device_sent_stamps_and_clears() -> None:
 
 def test_last_sent_is_restored_per_key_device() -> None:
     # A key added since the last send has no stamp yet, so its control stays empty.
-    config = Config(
-        "03:00",
-        [Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 0)])],
-        days_of_week=ALL_DAYS,
-    )
+    config = _config(Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 0)]))
     client = FakeClient()
     devices = mqtt_device.WateriusDevices(
         client, config=config, version="1.0.0", last_sent=["2026-01-01 03:00:00"]
@@ -151,9 +156,7 @@ def test_failed_send_flags_only_last_error() -> None:
 
 def test_key_device_title_masks_key() -> None:
     # A full-length key, so masking runs on the same input length as in production.
-    config = Config(
-        "03:00", [Device("01234567890123456789012345678901", [Channel("dev/cold", 0)])], days_of_week=ALL_DAYS
-    )
+    config = _config(Device("01234567890123456789012345678901", [Channel("dev/cold", 0)]))
     client = FakeClient()
     _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
@@ -163,11 +166,7 @@ def test_key_device_title_masks_key() -> None:
 def test_key_device_title_prefers_device_name() -> None:
     # The "Waterius - " prefix survives a configured name, so our devices stay recognizable
     # in the flat device list.
-    config = Config(
-        "03:00",
-        [Device("01234567890123456789012345678901", [Channel("dev/cold", 0)], name="Котельная")],
-        days_of_week=ALL_DAYS,
-    )
+    config = _config(Device("01234567890123456789012345678901", [Channel("dev/cold", 0)], name="Котельная"))
     client = FakeClient()
     _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
@@ -175,11 +174,7 @@ def test_key_device_title_prefers_device_name() -> None:
 
 
 def test_each_key_becomes_its_own_device() -> None:
-    config = Config(
-        "03:00",
-        [Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 2)])],
-        days_of_week=ALL_DAYS,
-    )
+    config = _config(Device("K1", [Channel("dev/a", 0)]), Device("K2", [Channel("dev/b", 2)]))
     client = FakeClient()
     _devices(client, config).create()
     assert client.last(f"{KEY_DEVICE1_BASE}/meta") is not None
@@ -206,7 +201,7 @@ def test_each_key_becomes_its_own_device() -> None:
     ],
 )
 def test_key_device_channel_units_by_type(data_type: int, units: str) -> None:
-    config = Config("03:00", [Device("K1", [Channel("dev/c", data_type)])], days_of_week=ALL_DAYS)
+    config = _config(Device("K1", [Channel("dev/c", data_type)]))
     client = FakeClient()
     _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
@@ -215,9 +210,7 @@ def test_key_device_channel_units_by_type(data_type: int, units: str) -> None:
 
 
 def test_duplicate_type_within_key_gets_source_suffix() -> None:
-    config = Config(
-        "03:00", [Device("K1", [Channel("dev/cold1", 0), Channel("dev/cold2", 0)])], days_of_week=ALL_DAYS
-    )
+    config = _config(Device("K1", [Channel("dev/cold1", 0), Channel("dev/cold2", 0)]))
     client = FakeClient()
     _devices(client, config).create()
     first = json.loads(client.last(f"{KEY_DEVICE1_BASE}/controls/ch0/meta"))
@@ -227,11 +220,7 @@ def test_duplicate_type_within_key_gets_source_suffix() -> None:
 
 
 def test_update_channel_routes_to_owning_key_device() -> None:
-    config = Config(
-        "03:00",
-        [Device("K1", [Channel("d1/cold", 0)]), Device("K2", [Channel("d2/cold", 0)])],
-        days_of_week=ALL_DAYS,
-    )
+    config = _config(Device("K1", [Channel("d1/cold", 0)]), Device("K2", [Channel("d2/cold", 0)]))
     client = FakeClient()
     devices = _devices(client, config)
     devices.update_channel("/devices/d2/controls/cold", "84.20")
@@ -243,10 +232,8 @@ def test_update_channel_mirrors_one_source_onto_every_channel_that_uses_it() -> 
     # One control can feed several channels — the config allows the same mqttTopicName twice,
     # deliberately — and every mirror has to move, not just the first.
     source = "dev/cold"
-    config = Config(
-        "03:00",
-        [Device("K1", [Channel(source, 0), Channel(source, 1)]), Device("K2", [Channel(source, 0)])],
-        days_of_week=ALL_DAYS,
+    config = _config(
+        Device("K1", [Channel(source, 0), Channel(source, 1)]), Device("K2", [Channel(source, 0)])
     )
     client = FakeClient()
     devices = _devices(client, config)
@@ -335,12 +322,12 @@ def test_clear_all_wipes_our_leftovers_and_spares_foreign_devices() -> None:
 def test_clear_through_the_facade_cannot_toggle_the_switch() -> None:
     # The wipe scans our own devices, so the broker re-delivers a stuck retained command to
     # whatever still listens on it. Without dropping the subscription first, that flips
-    # automatic sending behind the user's back — reproduced on the stand before the fix.
+    # automatic sending behind the user's back.
     command = f"{INTEGRATION_BASE}/controls/enabled/on"
     client = _DeliveringClient({f"{INTEGRATION_BASE}/meta": "{}", command: "0"})
     toggled: list[bool] = []
     devices = _devices(client, _single_config(), on_toggle=toggled.append)
-    devices.subscribe()
+    devices.subscribe_switch()
     devices.clear()
     assert not toggled
     assert client.last(command) == ""  # and the command itself is gone
@@ -352,6 +339,69 @@ def test_clear_through_the_facade_wipes_the_same_topics() -> None:
         f"{KEY_DEVICE1_BASE}/meta",
         f"{INTEGRATION_BASE}/meta",
     }
+
+
+def test_a_key_device_error_survives_a_reconnect() -> None:
+    # The reconnect wipes the card and recreates it, while the service keeps its verdict in
+    # memory. A device that forgot its error would leave the integration red without a reason.
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.create()
+    devices.mark_device_failed(0, "Key not accepted by Waterius")
+    devices.remove()
+    devices.create()
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == "Key not accepted by Waterius"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == "w"
+
+
+def test_a_successful_send_clears_the_remembered_error() -> None:
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.mark_device_failed(0, "HTTP 500")
+    devices.mark_device_sent(0, "2026-01-01 03:00:00")
+    devices.remove()
+    devices.create()
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") == ""
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error/meta/error") == ""
+
+
+def test_remove_empties_everything_create_published() -> None:
+    # A clean stop must leave nothing behind, so the removal list has to cover the whole device.
+    client = FakeClient()
+    devices = _devices(client, _single_config())
+    devices.create()
+    created = {topic for topic, *_ in client.published}
+    client.published.clear()
+    devices.remove()
+    emptied = {topic for topic, payload, *_ in client.published if payload == ""}
+    assert created <= emptied
+
+
+def test_remove_empties_device_meta_after_its_controls() -> None:
+    # An interrupted removal leaves the device discoverable, so a later scan still finds it.
+    removed = _devices(FakeClient(), _single_config()).remove()
+    assert removed.index(f"{KEY_DEVICE1_BASE}/controls/ch0/meta") < removed.index(f"{KEY_DEVICE1_BASE}/meta")
+    assert removed[-1] == f"{INTEGRATION_BASE}/meta"
+
+
+def test_remove_wipes_the_switch_command_topic() -> None:
+    # A retained command outliving us would reach the next start as a command from the user.
+    command = f"{INTEGRATION_BASE}/controls/enabled/on"
+    client = FakeClient()
+    toggled: list[bool] = []
+    devices = _devices(client, _single_config(), on_toggle=toggled.append)
+    devices.subscribe_switch()
+    devices.remove()
+    assert client.last(command) == ""
+    assert command not in client.callbacks  # the subscription went before the wipe
+    assert not toggled
+
+
+def test_remove_asks_the_broker_for_nothing() -> None:
+    # Unlike clear(), the stop path knows its own topics and must not pay a scan timeout.
+    client = _DeliveringClient({f"{KEY_DEVICE1_BASE}/meta": "{}"})
+    _devices(client, _single_config()).remove()
+    assert not client.subscribed
 
 
 def test_mark_device_out_of_range_is_a_no_op() -> None:
@@ -366,7 +416,7 @@ def test_mark_device_out_of_range_is_a_no_op() -> None:
 def test_no_configured_devices_publishes_the_integration_device_only() -> None:
     # The fresh-install state: no keys yet, the daemon idles instead of crash-looping.
     client = FakeClient()
-    _devices(client, Config("03:00", [], days_of_week=ALL_DAYS)).create()
+    _devices(client, _config()).create()
     assert client.last(f"{INTEGRATION_BASE}/meta") is not None
     assert not [topic for topic, *_ in client.published if topic.startswith(f"{INTEGRATION_BASE}_")]
 
@@ -389,7 +439,7 @@ def test_integration_status_controls_carry_meta_and_a_startup_state() -> None:
 def test_wait_for_broker_confirms_when_its_token_returns() -> None:
     client = FakeClient()
     assert mqtt_device.wait_for_broker(client, timeout=1) is True
-    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
+    assert mqtt_device.MARKER_TOPIC in [topic for topic, *_ in client.published]
 
 
 def test_wait_for_broker_reports_an_unconfirmed_wait() -> None:
@@ -402,7 +452,7 @@ def test_scan_ends_on_its_own_marker_and_not_on_the_timeout() -> None:
     started = time.monotonic()
     mqtt_device.clear_all(client, timeout=30)
     assert time.monotonic() - started < 1
-    assert MARKER_TOPIC in [topic for topic, *_ in client.published]
+    assert mqtt_device.MARKER_TOPIC in [topic for topic, *_ in client.published]
 
 
 def test_scan_falls_back_to_the_timeout_when_the_marker_is_not_ours() -> None:

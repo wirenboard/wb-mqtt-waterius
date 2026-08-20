@@ -17,6 +17,10 @@ TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 # rows. This check is for a hand-edited config file.
 MAX_CHANNELS = 4
 
+# Waterius rejects a longer serial with HTTP 400 and drops the whole request, so one long
+# serial loses the readings of every meter on the key.
+MAX_SERIAL_LENGTH = 15
+
 # Waterius data-type codes. A code outside the range does not exist and the cloud renders an
 # unknown one as water, so a typo would silently land in the wrong meter.
 DATA_TYPES = range(10)
@@ -33,20 +37,18 @@ class ConfigError(Exception):
 
 class Channel:
     """
-    One meter channel — a source MQTT topic, its Waterius data-type and serial.
+    One meter channel — a source control, its Waterius data-type and serial.
 
-    The topic is kept in the short `<device>/<control>` form the configurator writes and is
-    expanded to a full MQTT topic on demand.
+    The source is kept in the short `<device>/<control>` form the configurator writes and is
+    expanded to a full MQTT topic on demand, which is what `mqtt_topic` is for.
 
     Args:
-        topic: source control as `<device>/<control>`
+        source: source control as `<device>/<control>`
         data_type: Waterius data-type code, an int (the configurator always writes one)
         serial: optional meter serial number, empty is stored as None
 
     Examples:
         >>> channel = Channel("waterius-demo/cold_water", "0")
-        >>> channel.device
-        'waterius-demo'
         >>> channel.control
         'cold_water'
         >>> channel.mqtt_topic
@@ -55,31 +57,25 @@ class Channel:
         0
     """
 
-    def __init__(self, topic: str, data_type: Union[int, str], serial: Optional[str] = None) -> None:
-        self.topic: str = topic
+    def __init__(self, source: str, data_type: Union[int, str], serial: Optional[str] = None) -> None:
+        self.source: str = source
         self.data_type: int = int(data_type)
         self.serial: Optional[str] = serial or None
 
     @property
-    def device(self) -> str:
-        """
-        Device id part of the source topic.
-        """
-        return self.topic.split("/", 1)[0]
-
-    @property
     def control(self) -> str:
         """
-        Control id part of the source topic.
+        Control id part of the source, the only part anything outside needs on its own.
         """
-        return self.topic.split("/", 1)[1]
+        return self.source.split("/", 1)[1]
 
     @property
     def mqtt_topic(self) -> str:
         """
         Full MQTT topic of the source control.
         """
-        return f"/devices/{self.device}/controls/{self.control}"
+        device, control = self.source.split("/", 1)
+        return f"/devices/{device}/controls/{control}"
 
 
 @dataclass(eq=False)
@@ -120,23 +116,29 @@ class Config:
 
 
 def _parse_channel(raw_channel: dict) -> Channel:
-    topic = raw_channel.get("mqttTopicName")
-    if not topic or "/" not in topic:
-        raise ConfigError(f"channel mqttTopicName must be 'device/control', got {topic!r}")
+    source = raw_channel.get("mqttTopicName")
+    if not source or "/" not in source:
+        raise ConfigError(f"channel mqttTopicName must be 'device/control', got {source!r}")
     if "dataType" not in raw_channel:
-        raise ConfigError(f"channel {topic!r} has no dataType")
+        raise ConfigError(f"channel {source!r} has no dataType")
     try:
         data_type = int(raw_channel["dataType"])
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"channel {topic!r} has a non-numeric dataType {raw_channel['dataType']!r}"
+            f"channel {source!r} has a non-numeric dataType {raw_channel['dataType']!r}"
         ) from exc
     if data_type not in DATA_TYPES:
         raise ConfigError(
-            f"channel {topic!r} has unknown dataType {data_type}, "
+            f"channel {source!r} has unknown dataType {data_type}, "
             f"expected {min(DATA_TYPES)}..{max(DATA_TYPES)}"
         )
-    return Channel(topic, data_type, raw_channel.get("serial"))
+    serial = raw_channel.get("serial")
+    serial_length = len(str(serial)) if serial else 0
+    if serial_length > MAX_SERIAL_LENGTH:
+        raise ConfigError(
+            f"channel {source!r} has a {serial_length}-character serial, max is {MAX_SERIAL_LENGTH}"
+        )
+    return Channel(source, data_type, serial)
 
 
 def _parse_device(raw_device: dict) -> Device:
@@ -156,7 +158,7 @@ def _find_duplicate_key(devices: list[Device]) -> Optional[str]:
     """
     Return the first key used by more than one device, None when all keys are unique.
 
-    Two devices sharing a key collapse the per-device daily dedup: the second one is skipped
+    Two devices sharing a key collapse into one in the saved state, so the second one counts
     as already sent today and never updates its display.
 
     Examples:

@@ -1,5 +1,8 @@
 import re
 
+import pytest
+
+from wb.mqtt_waterius import main
 from wb.mqtt_waterius.version import get_version
 
 # WB Debian packaging expects exactly MAJOR.MINOR.PATCH. Neither dpkg nor PEP 440 enforces it,
@@ -20,3 +23,11 @@ def test_installed_version_is_release_version() -> None:
 
 def test_four_part_version_is_rejected() -> None:
     assert not _is_release_version("1.0.0.1")
+
+
+def test_version_argument_prints_version_and_exits(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main.main(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == get_version()

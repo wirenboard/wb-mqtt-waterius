@@ -148,7 +148,8 @@
                   "type": "string",
                   "propertyOrder": 3,
                   "title": "wateriusChannelSerialTitle",
-                  "description": "wateriusChannelSerialDescription"
+                  "description": "wateriusChannelSerialDescription",
+                  "maxLength": 15
                 }
               },
               "required": ["mqttTopicName", "dataType"]
@@ -168,8 +169,8 @@
       "wateriusTitle": "Submit Meter Readings to Waterius",
       "wateriusDescription": "Send readings of meters connected to Wiren Board to the waterius.ru personal cabinet.",
       "wateriusChannelTitle": "Channel",
-      "wateriusChannelTopicTitle": "MQTT Control",
-      "wateriusChannelTopicPatternMessage": "Specify the control as device/control",
+      "wateriusChannelTopicTitle": "MQTT Channel",
+      "wateriusChannelTopicPatternMessage": "Specify the channel as device/control",
       "wateriusDataTypeTitle": "Meter Type",
       "wateriusDataTypeColdWater": "Cold Water",
       "wateriusDataTypeHotWater": "Hot Water",
@@ -182,14 +183,14 @@
       "wateriusDataTypeElectricitySemiPeak": "Electricity (Semi-Peak)",
       "wateriusDataTypeDrinkingWater": "Potable Water",
       "wateriusChannelSerialTitle": "Serial Number",
-      "wateriusChannelSerialDescription": "Optional meter serial number. Edit it in the Waterius personal cabinet.",
+      "wateriusChannelSerialDescription": "Optional meter serial number. Replaces the number set in the Waterius cabinet.",
       "wateriusDeviceTitle": "Device",
       "wateriusDeviceNameTitle": "Device Name",
       "wateriusDeviceNameDescription": "Device name in the Waterius personal cabinet. Updated there on every reading upload. Leave empty to keep the name set in the cabinet.",
       "wateriusDeviceKeyTitle": "API Key",
       "wateriusDeviceKeyDescription": "Unique device key. Log in to account.waterius.ru, add a device (Smart home -> WirenBoard), copy the key.",
       "wateriusMetersTitle": "Meters",
-      "wateriusMetersDescription": "Up to 4 meters per key. For more meters add another device with its own key.",
+      "wateriusMetersDescription": "Up to 4 meters per key. The channel value must be a cumulative reading.",
       "wateriusSendTimeTitle": "Send Time",
       "wateriusSendTimeDescription": "Time of day to send automatically on the selected days.",
       "wateriusSendTimePatternMessage": "Time must be in HH:MM format, e.g. 03:00",
@@ -203,14 +204,14 @@
       "wateriusDaySaturday": "Saturday",
       "wateriusDaySunday": "Sunday",
       "wateriusDevicesTitle": "Waterius Devices",
-      "wateriusDevicesDescription": "One key = one Waterius device = up to 4 meters."
+      "wateriusDevicesDescription": "One device is one key, one billing account and up to 4 meters."
     },
     "ru": {
       "wateriusTitle": "Подача показаний счетчиков в Ватериус",
       "wateriusDescription": "Отправка показаний счетчиков, подключенных к Wiren Board, в личный кабинет waterius.ru.",
       "wateriusChannelTitle": "Канал",
-      "wateriusChannelTopicTitle": "Контрол MQTT",
-      "wateriusChannelTopicPatternMessage": "Укажите контрол в виде device/control",
+      "wateriusChannelTopicTitle": "Канал MQTT",
+      "wateriusChannelTopicPatternMessage": "Укажите канал в виде device/control",
       "wateriusDataTypeTitle": "Тип счетчика",
       "wateriusDataTypeColdWater": "Холодная вода",
       "wateriusDataTypeHotWater": "Горячая вода",
@@ -223,14 +224,14 @@
       "wateriusDataTypeElectricitySemiPeak": "Электричество (Полупик)",
       "wateriusDataTypeDrinkingWater": "Питьевая вода",
       "wateriusChannelSerialTitle": "Серийный номер",
-      "wateriusChannelSerialDescription": "Необязательный серийный номер счетчика. Редактируется в личном кабинете Ватериус.",
+      "wateriusChannelSerialDescription": "Необязательный серийный номер счетчика. Заменяет номер, заданный в личном кабинете Ватериус.",
       "wateriusDeviceTitle": "Устройство",
       "wateriusDeviceNameTitle": "Название устройства",
       "wateriusDeviceNameDescription": "Название устройства в личном кабинете Ватериус. Обновляется в кабинете при каждой отправке показаний. Оставьте пустым, чтобы сохранить название, заданное в кабинете.",
       "wateriusDeviceKeyTitle": "Ключ",
       "wateriusDeviceKeyDescription": "Уникальный ключ устройства. Войдите на account.waterius.ru, добавьте устройство (Умный дом -> WirenBoard), скопируйте ключ.",
       "wateriusMetersTitle": "Счетчики",
-      "wateriusMetersDescription": "До 4 счетчиков на один ключ. Для большего числа добавьте еще устройство со своим ключом.",
+      "wateriusMetersDescription": "До 4 счетчиков на один ключ. Значение канала — показание нарастающим итогом.",
       "wateriusSendTimeTitle": "Время отправки",
       "wateriusSendTimeDescription": "Время автоматической отправки в выбранные дни.",
       "wateriusSendTimePatternMessage": "Время в формате ЧЧ:ММ, например 03:00",
@@ -244,7 +245,7 @@
       "wateriusDaySaturday": "Суббота",
       "wateriusDaySunday": "Воскресенье",
       "wateriusDevicesTitle": "Устройства Ватериус",
-      "wateriusDevicesDescription": "Один ключ = одно устройство Ватериус, до 4 счетчиков."
+      "wateriusDevicesDescription": "Одно устройство — это один ключ, один лицевой счет и до 4 счетчиков."
     }
   }
 }
