@@ -62,10 +62,11 @@ def load_state() -> State:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    return {
+    state: State = {
         "enabled": bool(data.get("enabled", True)),
         "last_sent": _get_sent_moments(data.get("last_sent")),
     }
+    return state
 
 
 def _get_sent_moments(raw: Any) -> dict[str, str]:
