@@ -27,7 +27,12 @@ from wb.mqtt_waterius.mqtt_device import (
     clear_all,
     wait_for_broker,
 )
-from wb.mqtt_waterius.schedule import format_datetime, next_run
+from wb.mqtt_waterius.schedule import (
+    format_datetime,
+    get_due_send_time,
+    get_unsent_device_positions,
+    next_run,
+)
 from wb.mqtt_waterius.state import State, key_hash, load_state, save_state
 from wb.mqtt_waterius.version import get_version
 from wb.mqtt_waterius.waterius_api import (
@@ -69,13 +74,6 @@ def _display_stamp(moment: Optional[str]) -> str:
     Format a stored moment for the Last Sent control, empty string when there is none.
     """
     return datetime.datetime.fromisoformat(moment).strftime(TIMESTAMP_FORMAT) if moment else ""
-
-
-def _sent_before(moment: Optional[str], slot: datetime.datetime) -> bool:
-    """
-    Whether a device is missing its moment or last sent before the given one.
-    """
-    return not moment or datetime.datetime.fromisoformat(moment) < slot
 
 
 def _wait_connected(connected_event: threading.Event, timeout: int) -> None:
@@ -265,6 +263,17 @@ class Service:  # pylint: disable=too-many-instance-attributes
         for topic in self._config.all_topics():
             self._client.subscribe(topic)
             self._client.message_callback_add(topic, self._on_reading)
+
+    def _unsubscribe_readings(self) -> None:
+        """
+        Drop the source subscriptions, before the devices are taken off the broker.
+
+        The callback goes first, so a reading already on its way cannot mirror itself into a
+        channel the removal has just emptied.
+        """
+        for topic in self._config.all_topics():
+            self._client.message_callback_remove(topic)
+            self._client.unsubscribe(topic)
 
     def _get_channel_value(self, channel: Channel) -> Optional[float]:
         raw = self._source_values.get(channel.mqtt_topic)
@@ -464,26 +473,15 @@ class Service:  # pylint: disable=too-many-instance-attributes
                 return False
             return not (pending or held)
 
-    def _get_unsent_devices(self, now: datetime.datetime) -> list[int]:
+    def _get_unsent_devices(self, send_time: datetime.datetime) -> list[int]:
         """
-        Devices that have not sent since today's scheduled minute, in config order.
+        Devices that have not sent since the given send time, in config order.
 
-        This is the whole retry mechanism. A device that failed, one whose value had not
-        arrived yet and one that was never tried because the service was down all look the
-        same here, so a restart resumes the day instead of losing it. A later send time makes
-        every device unsent by itself, nothing has to be reset. Devices held after a 404 stay
-        out, retrying an unregistered key today is pointless.
-
-        Args:
-            now: current moment, its date sets the slot the moments are compared against
+        The state side of schedule.get_unsent_device_positions.
         """
-        slot = now.replace(hour=self._send_hour, minute=self._send_minute, second=0, microsecond=0)
         moments = self._state["last_sent"]
-        return [
-            index
-            for index, device in enumerate(self._config.devices)
-            if index not in self._failed_hold and _sent_before(moments.get(key_hash(device.key)), slot)
-        ]
+        last_sent_by_device = [moments.get(key_hash(device.key)) for device in self._config.devices]
+        return get_unsent_device_positions(last_sent_by_device, send_time, self._failed_hold)
 
     def _update_integration_error(self) -> None:
         """
@@ -512,9 +510,8 @@ class Service:  # pylint: disable=too-many-instance-attributes
         if not self._enabled or not self._config.devices:
             return
         now = self._datetime_now()
-        if now.weekday() not in self._config.days_of_week:
-            return
-        if (now.hour, now.minute) < (self._send_hour, self._send_minute):
+        send_time = get_due_send_time(now, self._send_hour, self._send_minute, self._config.days_of_week)
+        if send_time is None:
             return
         today = now.date().isoformat()
         # The first pass of the day to get here is the one that finds today's slot behind it,
@@ -527,12 +524,12 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._last_schedule_run = (today, now.hour, now.minute)
         if first_pass_today:
             self._publish_next_run()
-        if (now.hour, now.minute) == (self._send_hour, self._send_minute):
+        if now.replace(second=0, microsecond=0) == send_time:
             self.send_now()
             return
-        unsent = self._get_unsent_devices(now)
-        if unsent:
-            self._send_batch(unsent)
+        unsent_devices = self._get_unsent_devices(send_time)
+        if unsent_devices:
+            self._send_batch(unsent_devices)
 
     def _on_connect(self, _client: MQTTClient, _userdata: Any, _flags: Any, rc: int) -> None:
         """
@@ -629,6 +626,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         if not self._connected_event.is_set():
             return  # never connected, so nothing of ours reached the broker
         try:
+            self._unsubscribe_readings()
             removed = self._wb_devices.remove()
             if not wait_for_broker(self._client):
                 logger.warning("Broker did not confirm removing %d topics", len(removed))
@@ -714,7 +712,12 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGHUP, _handle_stop)
-    service.run()
+
+    try:
+        service.run()
+    except OSError as exc:
+        logger.error("MQTT transport error: %s", exc)
+        return EXIT_FAILURE
 
     return EXIT_SUCCESS
 
@@ -727,7 +730,12 @@ def main_send_once(
     service = _prepare_service(config_path, client or MQTTClient(f"{CLIENT_ID}-send"))
     if service is None:
         return EXIT_CONFIG_ERROR
-    return EXIT_SUCCESS if service.run_once(dry_run=dry_run) else EXIT_FAILURE
+    try:
+        sent = service.run_once(dry_run=dry_run)
+    except OSError as exc:
+        logger.error("MQTT transport error: %s", exc)
+        return EXIT_FAILURE
+    return EXIT_SUCCESS if sent else EXIT_FAILURE
 
 
 def main_cleanup(client: Optional[MQTTClient] = None) -> int:

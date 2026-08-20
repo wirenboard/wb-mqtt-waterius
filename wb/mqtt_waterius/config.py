@@ -104,8 +104,8 @@ class Config:
 
     @property
     def send_hour_minute(self) -> tuple[int, int]:
-        match = TIME_RE.match(self.send_time)
-        return int(match.group(1)), int(match.group(2))
+        hour, minute = self.send_time.split(":")
+        return int(hour), int(minute)
 
     def all_topics(self) -> set[str]:
         topics: set[str] = set()

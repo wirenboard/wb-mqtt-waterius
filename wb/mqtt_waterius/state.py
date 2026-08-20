@@ -58,7 +58,8 @@ def load_state() -> State:
     try:
         with open(STATE_FILE, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        logger.warning("Cannot read state file, falling back to defaults: %s", exc)
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -94,11 +95,12 @@ def save_state(state: State) -> None:
     Write the state atomically.
 
     The write goes to a temp file and os.replace moves it into place, so a crash never
-    leaves a half-written state.json behind.
+    leaves a half-written state.json behind. The temp name carries the pid, so the daemon and
+    a manual send cannot truncate each other's write.
     """
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
+        tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(state, handle, ensure_ascii=False, indent=2)
             handle.flush()

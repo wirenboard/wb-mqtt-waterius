@@ -58,7 +58,8 @@ HTTP API (`https://uc.waterius.ru`). Сервис читает значения 
 
 ### 2.2. Кодстайл
 
-- `black --line-length 110`, `isort --profile black` (`wb` объявлен first-party в `pyproject.toml`, флаг `-p wb` не нужен), `pylint` по конфигу codestyle
+- `black --line-length 110`, `isort --profile black` (`wb/` лежит в корне запуска, isort сам считает
+  его first-party, флаг `-p wb` не нужен), `pylint` по конфигу codestyle
 - Абсолютные импорты полным путём (`from wb.mqtt_waterius.<mod> import …`)
 - Namespace-раскладка `wb.mqtt_waterius` (каталог `wb/` — PEP420, без `__init__`)
 - Полная типизация модулей и тестов
@@ -236,6 +237,11 @@ Last Will (9.9). Неподтверждённое снятие уходит пр
 после рестарта карточка чистая, а первая же попытка вернёт ошибку, если она не ушла. Догон ограничен
 календарным днём: после полуночи `now < HH:MM`, и до следующего планового фаера не шлётся ничего.
 
+Не-404 ошибка сервера (400, 401, 403, 5xx) транзиентна наравне с сетевой — устройство уходит заново
+каждый проход до полуночи, хотя payload не меняется. Прошедший валидацию конфиг доводит до 400
+только NaN или Infinity в значении канала, `float()` их пропускает, а `json.dumps` пишет голым
+литералом.
+
 ### 4.5. Персистентное состояние (state.json)
 
 Единый файл `/var/lib/wb-mqtt-waterius/state.json`:
@@ -372,7 +378,8 @@ wb/mqtt_waterius/
 ├── version.py         # get_version (метадата) + parse_changelog_version/get_version_from_changelog
 ├── config.py          # Channel/Device/Config + parse_config/load_config
 ├── waterius_api.py    # WateriusClient + build_payload/mask_key, ChannelData/SendResult
-├── schedule.py        # next_run/format_datetime, WEEKDAY_NAMES
+├── schedule.py        # чистые решения расписания — get_due_send_time/get_unsent_device_positions,
+│                     #   next_run/format_datetime для UI, WEEKDAY_NAMES
 ├── mqtt_device.py     # _PublishedDevice -> IntegrationDevice/PerKeyDevice, WateriusDevices,
 │                     #   DATA_TYPE_CONTROLS
 ├── state.py           # STATE_FILE + load_state/save_state/key_hash (persist I/O)
@@ -403,7 +410,7 @@ WateriusDevices (менеджер-фасад — единый интерфейс
 Свободные функции: build_key_device_id(), _is_our_device(), _publish(), _wipe_topics(),
 wait_for_broker(), _scan_retained(), _discover_our_device_ids(), _scan_our_device_topics(),
 clear_all()
-DATA_TYPE_CONTROLS: data_type -> (тип WB-контрола, единицы, двуязычный заголовок)
+DATA_TYPE_CONTROLS: data_type -> (единицы, двуязычный заголовок)
 ```
 
 Устройство создаётся ОДНИМ вызовом `create()` — он публикует мету всех контролов и стартовое
@@ -439,8 +446,9 @@ Service  (персист-I/O вынесен в state.py: load_state/save_state)
 ├── _send_scheduled(): автоотправка (фаер в минуту всем / дожим неотправленных после минуты)
 ├── send_now(): все устройства одной пачкой, без оглядки на отметки (слот и CLI send)
 ├── _send_batch(): пачка по индексам -> раскладка в transient/hold
-├── _get_unsent_devices(): кто ещё не отправился сегодня, весь механизм ретрая
-│   (перенос времени вперёд делает неотправленными всех сам, сбрасывать нечего)
+├── _get_unsent_devices(): читает отметки из состояния и спрашивает schedule.get_unsent_device_positions,
+│   где записано само правило ретрая (перенос времени вперёд делает неотправленными всех
+│   сам, сбрасывать нечего)
 ├── dry_run_payloads(): собрать и напечатать payload'ы, в облако не ходит
 ├── _update_integration_error(): агрегат ошибок transient/hold на устройство интеграции
 ├── _on_toggle(): щелчок переключателя (persist + разбудить цикл, без публикаций)
@@ -484,9 +492,9 @@ main_daemon / main_send_once / main_cleanup — точки входа (exit-ко
 - `sendTime` — время (`_format: time`), grid 6, своя строка
 - `daysOfWeek` — дни недели (`_format: checkbox`, minItems 1, required), grid 12
 - `devices` — массив устройств (`array_controls_top`, `disable_array_delete_last_row`)
+  - `key` — ключ Waterius
   - `name` — название устройства (в схеме required, пустая строка допустима, `maxLength` 30,
     headerTemplate `{{self.name}}`)
-  - `key` — ключ Waterius
   - `channels` — массив каналов (до 4)
     - `mqttTopicName` — контрол-источник (`_format: wb-autocomplete`, паттерн `device/control`)
     - `dataType` — тип счётчика (enum 0..9, названия по кабинету Waterius)
@@ -591,6 +599,9 @@ main_daemon / main_send_once / main_cleanup — точки входа (exit-ко
 ### 9.2. Битый state.json
 
 `load_state` при непарсящемся JSON или JSON-не-объекте (`[]`) возвращает дефолты, не падает.
+При откате в журнал уходит warning с текстом исключения — дефолты возвращают `enabled` в `True` и
+обнуляют отметки, то есть выключенная пользователем автоотправка включается обратно, а показания за
+сутки уезжают заново.
 
 ### 9.3. Рестарт брокера mosquitto
 
@@ -648,8 +659,10 @@ clean-slate.
 дописывает к префиксу случайный суффикс, поэтому идентификаторы у двух процессов разные всегда.
 
 А вот `state.json` у процессов общий, межпроцессного лока нет.
-Запись атомарная, полуфайла не будет, но выигрывает последний писатель: демон держит свою копию
-состояния в памяти и на следующем сохранении затрёт отметку, поставленную ручной отправкой.
+Запись атомарная, полуфайла не будет — временный файл у каждого процесса свой
+(`state.json.<pid>.tmp`), а `os.replace` кладёт документ целиком. Но выигрывает последний
+писатель, демон держит свою копию состояния в памяти и на следующем сохранении затрёт отметку,
+поставленную ручной отправкой.
 Последствия косметические — демон может отправить ещё раз (в плановую минуту он это делает и так,
 см. 9.5), либо штамп «Отправлено» на карточке окажется от другого процесса. Файловый лок не заводим сознательно: он защищал бы поле, которое влияет только на
 отображение и на повтор, а повтор у нас безопасен — сервер Waterius хранит одно показание в
@@ -666,18 +679,7 @@ clean-slate.
 
 ---
 
-## 10. Статус реализации
-
-- Протокол Waterius изучен и проверен эмпирически (успех/ошибки/лимиты каналов, серийник в payload заменяет номер, заданный в кабинете)
-- Пакет собран по канону WB-python (namespace, setup.py из changelog, Jenkinsfile, wb-configs.d)
-- Реализовано: раскладка «устройство интеграции + устройства-ключи», планировщик с дожимом,
-  json-state с атомарной записью, реконнект, модель ошибок, маскировка ключа, grid-strict
-  схема, camelCase-переводы
-- Проверено на контроллере 192.168.1.144, включая реальные отправки в личный кабинет
-
----
-
-## 11. Технический долг / Возможные улучшения
+## 10. Технический долг / Возможные улучшения
 
 | Тема                                     | Приоритет | Предложение                                                           |
 | ---------------------------------------- | --------- | --------------------------------------------------------------------- |

@@ -74,11 +74,50 @@ class FakeApi:
         return None
 
 
+def _seeded_values(config: Config) -> dict[str, str]:
+    """
+    A value on every source topic of the config, so no device is skipped for missing data.
+
+    The reading itself is never significant, a test that cares about a particular one sets it
+    on its own.
+    """
+    return {channel.mqtt_topic: "10" for device in config.devices for channel in device.channels}
+
+
 def _patch_send(monkeypatch: pytest.MonkeyPatch, send: Callable[..., Any]) -> None:
     """
     Make every send batch build a fake cloud client with the given send().
     """
     monkeypatch.setattr(service, "WateriusClient", lambda endpoint: FakeApi(send))
+
+
+def _patch_send_returning(monkeypatch: pytest.MonkeyPatch, ok: bool = True, status: int = 200) -> list[dict]:
+    """
+    Patch the cloud client with a send of one fixed outcome and collect what it was given.
+
+    Args:
+        monkeypatch: the test's monkeypatch
+        ok: outcome every device of the batch gets
+        status: HTTP status behind that outcome
+
+    Returns:
+        The payloads in send order, filled as the send runs. _sent_keys turns them into keys.
+    """
+    sent: list[dict] = []
+
+    def send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+        sent.append(payload)
+        return waterius_api.SendResult(ok, status)
+
+    _patch_send(monkeypatch, send)
+    return sent
+
+
+def _sent_keys(payloads: list[dict]) -> list[str]:
+    """
+    Keys of the collected payloads, in send order.
+    """
+    return [payload["key"] for payload in payloads]
 
 
 def test_get_channel_value_coercion() -> None:
@@ -171,37 +210,27 @@ def test_send_scheduled(case: _ScheduleCase, monkeypatch: pytest.MonkeyPatch) ->
     # it only a device without today's mark goes out.
     now, days_of_week, enabled, sent_today, expected = case
     config = _config(Device("K1", [Channel("d/c", 0)]), days_of_week=days_of_week)
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"}, enabled=enabled, now=now)
+    service_instance, _ = _service(config, values=_seeded_values(config), enabled=enabled, now=now)
     if sent_today:
         service_instance._state["last_sent"][state.key_hash("K1")] = NOW.isoformat()
-    sent: list[str] = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    sent = _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
-    assert sent == expected
+    assert _sent_keys(sent) == expected
 
 
 def test_send_scheduled_tries_a_failing_device_once_a_minute(monkeypatch: pytest.MonkeyPatch) -> None:
     # A reconnect wakes the poll early, so the same minute can come round twice. A device that
     # failed must not be re-POSTed seconds later, the retry cadence is a minute.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"}, now=NOW)  # 12:00 exact
-    sent: list[str] = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(False, 503),
-    )
+    service_instance, _ = _service(config, values=_seeded_values(config), now=NOW)  # 12:00 exact
+    sent = _patch_send_returning(monkeypatch, ok=False, status=503)
     service_instance._send_scheduled()
     service_instance._send_scheduled()
-    assert sent == ["K1"]
+    assert _sent_keys(sent) == ["K1"]
 
     service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 16, 12, 1)
     service_instance._send_scheduled()
-    assert sent == ["K1", "K1"]  # the next minute tries again
+    assert _sent_keys(sent) == ["K1", "K1"]  # the next minute tries again
 
 
 @pytest.mark.parametrize(
@@ -218,35 +247,25 @@ def test_a_moment_is_compared_with_the_slot(
     # The device sent at 12:00 today. Moving the send time to 13:00 puts that moment before the
     # new slot, so it owes again, while the unchanged 12:00 slot leaves it alone.
     config = Config(config_time, [Device("K1", [Channel("d/c", 0)])], days_of_week=ALL_DAYS)
-    topic = config.devices[0].channels[0].mqtt_topic
     service_instance, _ = _service(
         config,
-        values={topic: "10"},
+        values=_seeded_values(config),
         now=datetime.datetime(2026, 7, 16, 13, 5),
         stored_state={"last_sent": {state.key_hash("K1"): "2026-07-16T12:00:00"}},
     )
-    sent: list[str] = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    sent = _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
-    assert sent == expected_sent
+    assert _sent_keys(sent) == expected_sent
 
 
 def test_a_new_send_time_fires_again_the_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
     # 12:00 went through, then the user moves the send time to 15:00 in the configurator. The
     # restart that follows the config write reopens the day, and 15:00 fires once more.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"}, now=NOW)  # 12:00 exact
-    sent: list[str] = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    service_instance, _ = _service(config, values=_seeded_values(config), now=NOW)  # 12:00 exact
+    sent = _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
-    assert sent == ["K1"]
+    assert _sent_keys(sent) == ["K1"]
 
     moved = Config("15:00", config.devices, days_of_week=ALL_DAYS)
     restarted = service.Service(
@@ -255,16 +274,15 @@ def test_a_new_send_time_fires_again_the_same_day(monkeypatch: pytest.MonkeyPatc
         datetime_now_fn=lambda: datetime.datetime(2026, 7, 16, 15, 0),
         client=FakeClient(),
     )
-    restarted._source_values = {topic: "10"}
+    restarted._source_values = _seeded_values(config)
     restarted._send_scheduled()
-    assert sent == ["K1", "K1"]
+    assert _sent_keys(sent) == ["K1", "K1"]
 
 
 def test_send_now_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic: "10"})
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance, client = _service(config, values=_seeded_values(config))
+    _patch_send_returning(monkeypatch)
     assert service_instance.send_now() is True
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_ACTIVE)
     assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
@@ -274,9 +292,7 @@ def test_send_now_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, client = _service(config, values=_seeded_values(config))
 
     def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
         ok = payload["key"] == "K1"
@@ -303,16 +319,8 @@ def test_send_now_passes_device_name_to_payload(monkeypatch: pytest.MonkeyPatch)
         Device("K1", [Channel("d1/c", 0)], name="Котельная"),
         Device("K2", [Channel("d2/c", 0)]),
     )
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
-    sent: list[dict] = []
-
-    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
-        sent.append(payload)
-        return waterius_api.SendResult(True, 200)
-
-    _patch_send(monkeypatch, fake_send)
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    sent = _patch_send_returning(monkeypatch)
     assert service_instance.send_now() is True
     assert sent[0]["name"] == "Котельная"
     assert sent[1]["name"] == ""  # always sent; empty keeps the name in the cabinet
@@ -321,8 +329,7 @@ def test_send_now_passes_device_name_to_payload(monkeypatch: pytest.MonkeyPatch)
 def test_send_now_missing_channel_never_posts(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(Device("K1", [Channel("d/c", 0)]))
     service_instance, client = _service(config, values={})  # value never arrived
-    posted = []
-    _patch_send(monkeypatch, lambda *args, **kwargs: posted.append(1))
+    posted = _patch_send_returning(monkeypatch)
     assert service_instance.send_now() is False
     assert not posted  # partial/empty data is never sent
     assert "No data from channels" in client.last(f"{KEY_DEVICE1_BASE}/controls/last_error")
@@ -344,8 +351,7 @@ def test_dry_run_builds_no_client_and_has_no_side_effects(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(service, "WateriusClient", explode)
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic: "10"})
+    service_instance, client = _service(config, values=_seeded_values(config))
     assert service_instance.dry_run_payloads() is True
     assert not service_instance._state["last_sent"]
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") is None
@@ -357,6 +363,14 @@ def test_dry_run_reports_missing_readings() -> None:
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), values={})
     assert service_instance.dry_run_payloads() is False
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") is None  # status untouched by a dry run
+
+
+def test_dry_run_with_no_devices_reports_nothing_to_send() -> None:
+    # The state of every fresh install. There is nothing to build, and the answer is what the
+    # CLI turns into its exit code.
+    service_instance, client = _service(_config())
+    assert service_instance.dry_run_payloads() is False
+    assert not client.published  # a dry run leaves the status devices alone
 
 
 @pytest.mark.parametrize(
@@ -376,8 +390,7 @@ def test_await_readings(
     monkeypatch.setattr(service, "READINGS_TIMEOUT", timeout)
     monkeypatch.setattr(service, "READINGS_POLL", poll)
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"} if has_value else {})
+    service_instance, _ = _service(config, values=_seeded_values(config) if has_value else {})
     waits: list[float] = []
     monkeypatch.setattr(service_instance._stop_event, "wait", lambda seconds: waits.append(seconds) or False)
     service_instance._await_readings()
@@ -442,11 +455,10 @@ def test_a_missed_slot_minute_still_moves_next_execution(monkeypatch: pytest.Mon
     # A long pass steps over the exact minute. The catch-up sends what has no mark anyway, and
     # the next-run text has to follow the slot the loop never saw.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
     service_instance, client = _service(
-        config, values={topic: "10"}, now=datetime.datetime(2026, 7, 16, 12, 1)
+        config, values=_seeded_values(config), now=datetime.datetime(2026, 7, 16, 12, 1)
     )
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
     assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Friday 2026-07-17 12:00"
 
@@ -456,9 +468,9 @@ def test_the_next_run_text_goes_out_once_a_day(monkeypatch: pytest.MonkeyPatch) 
     config = _config(Device("K1", [Channel("d/c", 0)]))
     topic = config.devices[0].channels[0].mqtt_topic
     service_instance, client = _service(
-        config, values={topic: "10"}, now=datetime.datetime(2026, 7, 16, 12, 1)
+        config, values=_seeded_values(config), now=datetime.datetime(2026, 7, 16, 12, 1)
     )
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
     client.published.clear()
     service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 16, 12, 2)
@@ -470,9 +482,8 @@ def test_the_scheduled_fire_moves_next_execution(monkeypatch: pytest.MonkeyPatch
     # The slot has just been used, so the control has to point at the next allowed day. Nothing
     # else would move it before the next reconnect.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic: "10"})  # NOW is the send minute
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance, client = _service(config, values=_seeded_values(config))  # NOW is the send minute
+    _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
     assert client.last(f"{INTEGRATION_BASE}/controls/next_execution") == "Friday 2026-07-17 12:00"
 
@@ -521,6 +532,41 @@ def test_stop_removes_the_devices_while_the_client_is_still_up() -> None:
     assert before_stop[-1] == mqtt_device.MARKER_TOPIC  # the broker confirmed the wipe
 
 
+def test_stop_drops_the_source_subscriptions_before_the_wipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A reading arriving mid-removal would mirror itself back into a channel just emptied.
+    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    source = config.devices[0].channels[0].mqtt_topic
+    channel_topic = f"{KEY_DEVICE1_BASE}/controls/ch0"
+    service_instance, client = _service(config, enabled=False)
+    service_instance._setup_mqtt()
+    publish = client.publish
+
+    def publish_racing_a_reading(topic: str, payload: Any, retain: bool = False, qos: int = 0) -> None:
+        publish(topic, payload, retain, qos)
+        if topic == channel_topic and payload == "":
+            publish(source, "5")  # the source updates in the middle of the removal
+
+    monkeypatch.setattr(client, "publish", publish_racing_a_reading)
+    service_instance._connected_event.set()
+    service_instance._remove_devices()
+    assert client.last(channel_topic) == ""
+    assert source not in client.subscribed
+
+
+def test_stop_survives_a_broker_that_fails_mid_removal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Removal is the last thing a clean stop does, so a broker failing there can only be
+    # reported. The bare call is the assertion, an exception would end the stop in a traceback.
+    service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    service_instance._connected_event.set()
+
+    def broken_removal() -> list[str]:
+        raise RuntimeError("broker went away")
+
+    monkeypatch.setattr(service_instance._wb_devices, "remove", broken_removal)
+    service_instance._remove_devices()
+
+
 def test_a_crash_leaves_the_devices_on_the_broker(monkeypatch: pytest.MonkeyPatch) -> None:
     # Removal belongs to the clean path only. A daemon dying on an exception has to stay visible
     # and red in the UI, not disappear as if it had been stopped.
@@ -555,17 +601,11 @@ def test_send_now_interrupted_leaves_the_rest_unsent(monkeypatch: pytest.MonkeyP
     # Shutdown landing in the inter-device gap must leave the untouched devices without today's
     # mark, or they are silently skipped until tomorrow.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
-    sent = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    sent = _patch_send_returning(monkeypatch)
     monkeypatch.setattr(service_instance._stop_event, "wait", lambda _seconds: True)  # SIGTERM in the gap
     assert service_instance.send_now() is False
-    assert sent == ["K1"]  # only the first device was sent before the abort
+    assert _sent_keys(sent) == ["K1"]  # only the first device was sent before the abort
     # The mark of the device that DID send is on disk and K2 has none, so K2 is still unsent.
     persisted = state.load_state()["last_sent"]
     assert persisted[state.key_hash("K1")] == NOW.isoformat()
@@ -575,9 +615,8 @@ def test_send_now_interrupted_leaves_the_rest_unsent(monkeypatch: pytest.MonkeyP
 
 def test_per_device_timestamp_persisted_and_restored(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"})
-    _patch_send(monkeypatch, lambda *args, **kwargs: waterius_api.SendResult(True, 200))
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    _patch_send_returning(monkeypatch)
     service_instance.send_now()
     digest = state.key_hash("K1")
     stamp = NOW.strftime(service.TIMESTAMP_FORMAT)
@@ -597,9 +636,7 @@ def test_timestamp_is_taken_per_device_not_per_batch(monkeypatch: pytest.MonkeyP
     # must be the moment that device answered. A single batch-wide stamp would report the
     # slow device as sent at the time the fast one was.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, client = _service(config, values=_seeded_values(config))
     clock = [NOW]
 
     def advancing_now() -> datetime.datetime:
@@ -607,7 +644,7 @@ def test_timestamp_is_taken_per_device_not_per_batch(monkeypatch: pytest.MonkeyP
         return clock[0]
 
     monkeypatch.setattr(service_instance, "_datetime_now", advancing_now)
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    _patch_send_returning(monkeypatch)
     service_instance.send_now()
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") != client.last(
         f"{KEY_DEVICE2_BASE}/controls/last_sent"
@@ -634,26 +671,18 @@ def test_manual_send_ignores_todays_marks(monkeypatch: pytest.MonkeyPatch) -> No
     # The manual send has no rules: every device goes out with fresh values, even one already
     # sent earlier today.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, _ = _service(config, values=_seeded_values(config))
     service_instance._state["last_sent"][state.key_hash("K1")] = "2026-07-16T08:00:00"
-    sent = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    sent = _patch_send_returning(monkeypatch)
     assert service_instance.send_now() is True
-    assert sent == ["K1", "K2"]  # both sent, K1 not skipped despite today's mark
+    assert _sent_keys(sent) == ["K1", "K2"]  # both sent, K1 not skipped despite today's mark
 
 
 def test_send_now_permanent_404_holds_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
     # A 404 (key not registered) is held red and left out of the catch-up, chasing an
     # unregistered key for the rest of the day is pointless.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, client = _service(config, values=_seeded_values(config))
 
     def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
         # Mirror the real send, a 404 carries the KEY_NOT_FOUND_ERROR message.
@@ -675,9 +704,7 @@ def test_catch_up_resends_only_the_unsent_device(monkeypatch: pytest.MonkeyPatch
     # After a fire leaves K2 transiently failed, the next poll past the minute re-POSTs only K2.
     # On success it clears and the integration device returns to Active.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, client = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, client = _service(config, values=_seeded_values(config))
     calls = []
     fail_k2 = {"on": True}
 
@@ -704,13 +731,8 @@ def test_no_catch_up_after_the_day_rolls_over(monkeypatch: pytest.MonkeyPatch) -
     # Past midnight yesterday's reading is stale, so a device that failed is not chased any
     # more. The next scheduled fire rebuilds everything anyway.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"})
-    calls = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: calls.append(payload["key"]) or waterius_api.SendResult(False, 503),
-    )
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    calls = _patch_send_returning(monkeypatch, ok=False, status=503)
     service_instance.send_now()
     calls.clear()
     service_instance._datetime_now = lambda: datetime.datetime(2026, 7, 17, 0, 5)  # before 12:00
@@ -722,9 +744,7 @@ def test_a_restart_resumes_the_device_left_unsent(monkeypatch: pytest.MonkeyPatc
     # The point of the per-device marks. K1 went through and K2 did not, and nothing about the
     # retry lives in memory — a fresh Service on the same state file sends K2 alone.
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
-    topic1 = config.devices[0].channels[0].mqtt_topic
-    topic2 = config.devices[1].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic1: "10", topic2: "20"})
+    service_instance, _ = _service(config, values=_seeded_values(config))
     calls = []
     fail_k2 = {"on": True}
 
@@ -743,7 +763,7 @@ def test_a_restart_resumes_the_device_left_unsent(monkeypatch: pytest.MonkeyPatc
         datetime_now_fn=lambda: datetime.datetime(2026, 7, 16, 12, 5),
         client=FakeClient(),
     )
-    restarted._source_values = {topic1: "10", topic2: "20"}
+    restarted._source_values = _seeded_values(config)
     calls.clear()
     fail_k2["on"] = False  # K2 recovers while the service was down
     restarted._send_scheduled()
@@ -800,17 +820,12 @@ def test_the_slot_fires_again_the_next_day(monkeypatch: pytest.MonkeyPatch) -> N
     # The guard remembers the minute it fired in, so it has to remember the day as well —
     # otherwise a long-lived daemon fires on its first day and never again.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"})  # NOW is the send minute
-    sent: list[str] = []
-    _patch_send(
-        monkeypatch,
-        lambda payload, stop_event=None: sent.append(payload["key"]) or waterius_api.SendResult(True, 200),
-    )
+    service_instance, _ = _service(config, values=_seeded_values(config))  # NOW is the send minute
+    sent = _patch_send_returning(monkeypatch)
     service_instance._send_scheduled()
     service_instance._datetime_now = lambda: NOW + datetime.timedelta(days=1)
     service_instance._send_scheduled()
-    assert sent == ["K1", "K1"]
+    assert _sent_keys(sent) == ["K1", "K1"]
 
 
 def test_main_daemon_config_error_reports_invalid_state(
@@ -860,22 +875,53 @@ def test_main_send_maps_run_once_result(tmp_path: Path, monkeypatch: pytest.Monk
 def test_run_once_sends_and_returns_result(monkeypatch: pytest.MonkeyPatch) -> None:
     # run_once connects, waits for retained values, sends once, returns send_now's result.
     config = _config(Device("K1", [Channel("d/c", 0)]))
-    topic = config.devices[0].channels[0].mqtt_topic
-    service_instance, _ = _service(config, values={topic: "10"})
-    _patch_send(monkeypatch, lambda payload, stop_event=None: waterius_api.SendResult(True, 200))
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    _patch_send_returning(monkeypatch)
     assert service_instance.run_once() is True
 
 
-def test_on_reading_stores_value_and_mirrors_channel() -> None:
-    # The subscription callback decodes the payload, stores it in _values, and mirrors it
-    # onto the meter channel control.
+def test_run_once_dry_run_prints_instead_of_posting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The dry run and the real send differ by one ternary, and getting it backwards would post
+    # real readings from a command that promises to only print them.
+    def explode(_endpoint: str) -> None:
+        raise AssertionError("a dry run must not build a cloud client")
+
+    monkeypatch.setattr(service, "WateriusClient", explode)
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    service_instance, client = _service(config, values=_seeded_values(config))
+    assert service_instance.run_once(dry_run=True) is True
+    assert client.stopped
+    assert not service_instance._state["last_sent"]  # nothing was sent, so nothing was stamped
+
+
+@pytest.mark.parametrize("entry_point", [service.main_daemon, service.main_send_once], ids=["daemon", "send"])
+def test_an_unreachable_broker_is_reported_not_raised(
+    entry_point: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # After= only orders the start, so at boot the socket may not be there yet. That is not a
+    # bug of ours and must not reach the journal as a traceback.
+    conf = tmp_path / "w.conf"
+    _write_valid_config(conf)
+    monkeypatch.setattr(service, "signal", _FakeSignals())
+    client = FakeClient()
+
+    def refuse_connection() -> None:
+        raise ConnectionRefusedError("mosquitto is not listening yet")
+
+    monkeypatch.setattr(client, "start", refuse_connection)
+    assert entry_point(str(conf), client=client) == service.EXIT_FAILURE
+
+
+def test_on_reading_survives_a_payload_that_is_not_utf8() -> None:
+    # The callback runs on the paho thread, where an exception kills the reading flow for good,
+    # so a foreign topic publishing bytes that are not UTF-8 must decode with replacements.
     config = _config(Device("K1", [Channel("d/c", 0)]))
     topic = config.devices[0].channels[0].mqtt_topic
     service_instance, client = _service(config)
     service_instance._wb_devices.create()
-    service_instance._on_reading(None, None, Message(b"42", topic))
-    assert service_instance._source_values[topic] == "42"
-    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") == "42"
+    service_instance._on_reading(None, None, Message(b"12.5\xff", topic))
+    assert service_instance._source_values[topic] == "12.5\ufffd"
+    assert client.last(f"{KEY_DEVICE1_BASE}/controls/ch0") == "12.5\ufffd"
 
 
 def test_main_cleanup_clears_devices(monkeypatch: pytest.MonkeyPatch) -> None:

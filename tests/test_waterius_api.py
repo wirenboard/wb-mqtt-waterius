@@ -148,6 +148,17 @@ def test_send_400_reports_server_explanation() -> None:
     assert result.error == "Incorrect fields: serial0"
 
 
+def test_send_400_reports_an_error_object_as_text() -> None:
+    # The 400 the cloud answers with on a malformed body is an object, not a string or a list,
+    # and the control has to show its text rather than nothing.
+    body = '{"detail": "JSON parse error - Expecting value: line 1 column 1"}'
+    session = _SeqSession([_FakeResponse(400, body)])
+    result = _client(session).send({"key": "K"})
+    assert not result.ok
+    assert result.status_code == 400
+    assert result.error == body
+
+
 def test_send_ignores_a_body_that_is_not_json() -> None:
     session = _SeqSession([_FakeResponse(500, "<html>500 Internal Server Error</html>")])
     result = _client(session).send({"key": ""})

@@ -55,19 +55,18 @@ DEFAULT_SCAN_TIMEOUT = 5.0
 NO_TIME = "--:--"
 
 
-# data_type code -> (WB control type, units, bilingual title). All meters use the generic
-# "value" type with an explicit unit. Titles follow Waterius's own cabinet naming.
+# data_type code -> (units, bilingual title). Titles follow Waterius's own cabinet naming.
 DATA_TYPE_CONTROLS = {
-    0: ("value", "m^3", {"en": "Cold Water", "ru": "Холодная вода"}),
-    1: ("value", "m^3", {"en": "Hot Water", "ru": "Горячая вода"}),
-    2: ("value", "kWh", {"en": "Electricity", "ru": "Электричество"}),
-    3: ("value", "m^3", {"en": "Gas", "ru": "Газ"}),
-    4: ("value", "Gcal", {"en": "Heat", "ru": "Отопление"}),
-    5: ("value", "kWh", {"en": "Electricity (Day)", "ru": "Электричество (День)"}),
-    6: ("value", "kWh", {"en": "Electricity (Night)", "ru": "Электричество (Ночь)"}),
-    7: ("value", "kWh", {"en": "Electricity (Peak)", "ru": "Электричество (Пик)"}),
-    8: ("value", "kWh", {"en": "Electricity (Semi-Peak)", "ru": "Электричество (Полупик)"}),
-    9: ("value", "m^3", {"en": "Potable Water", "ru": "Питьевая вода"}),
+    0: ("m^3", {"en": "Cold Water", "ru": "Холодная вода"}),
+    1: ("m^3", {"en": "Hot Water", "ru": "Горячая вода"}),
+    2: ("kWh", {"en": "Electricity", "ru": "Электричество"}),
+    3: ("m^3", {"en": "Gas", "ru": "Газ"}),
+    4: ("Gcal", {"en": "Heat", "ru": "Отопление"}),
+    5: ("kWh", {"en": "Electricity (Day)", "ru": "Электричество (День)"}),
+    6: ("kWh", {"en": "Electricity (Night)", "ru": "Электричество (Ночь)"}),
+    7: ("kWh", {"en": "Electricity (Peak)", "ru": "Электричество (Пик)"}),
+    8: ("kWh", {"en": "Electricity (Semi-Peak)", "ru": "Электричество (Полупик)"}),
+    9: ("m^3", {"en": "Potable Water", "ru": "Питьевая вода"}),
 }
 
 # Numeric state codes for the integration device "state" control. The labels live in meta.enum.
@@ -391,15 +390,16 @@ class PerKeyDevice(_PublishedDevice):
     def _build_channels(self) -> None:
         type_counts = Counter(channel.data_type for channel in self._config_device.channels)
         for channel_index, channel in enumerate(self._config_device.channels):
-            wb_type, units, base = DATA_TYPE_CONTROLS.get(
+            units, base = DATA_TYPE_CONTROLS.get(
                 channel.data_type,
-                ("value", "", {"en": f"Type {channel.data_type}", "ru": f"Тип {channel.data_type}"}),
+                ("", {"en": f"Type {channel.data_type}", "ru": f"Тип {channel.data_type}"}),
             )
             # Disambiguate a repeated meter type by the short control name, not the full
             # topic: the UI cell truncates a long title on the tail that distinguishes it.
             suffix = f" ({channel.control})" if type_counts[channel.data_type] > 1 else ""
             title = {lang: text + suffix for lang, text in base.items()}
-            meta = {"type": wb_type, "readonly": True, "order": channel_index + 2, "title": title}
+            # A generic "value" control with an explicit unit
+            meta = {"type": "value", "readonly": True, "order": channel_index + 2, "title": title}
             if units:
                 meta["units"] = units
             control = Control(f"ch{channel_index}", meta)
