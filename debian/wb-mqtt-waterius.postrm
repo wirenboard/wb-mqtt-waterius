@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/wb-mqtt-waterius
+    rm -f /etc/wb-mqtt-waterius.conf.default
+fi
+
+#DEBHELPER#

@@ -1,0 +1,7 @@
+wb-mqtt-waterius (1.0.0) stable; urgency=medium
+
+  * Initial release.
+  * Daily send of Wiren Board meter readings to the waterius.ru cloud.
+  * json-editor configuration schema for Settings -> Configuration files.
+
+ -- Wiren Board Team <info@wirenboard.com>  Tue, 21 Jul 2026 18:59:00 +0000

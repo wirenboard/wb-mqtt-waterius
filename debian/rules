@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+
+# Creates the package metadata in the build directory before the tests run. tests/test_version.py
+# reads the version from that metadata, and pybuild creates it on its own only at the install
+# stage, which comes after the tests. No cleanup is needed afterwards, pybuild deletes the
+# metadata from the build directory itself before installing.
+export PYBUILD_BEFORE_TEST=cd {dir} && {interpreter} setup.py --quiet egg_info --egg-base {build_dir}
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
