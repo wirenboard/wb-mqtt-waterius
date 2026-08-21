@@ -25,7 +25,7 @@ from typing import Any, NamedTuple, Optional
 from wb_common.mqtt_client import MQTTClient
 
 from wb.mqtt_waterius.config import Config, Device
-from wb.mqtt_waterius.waterius_api import mask_key
+from wb.mqtt_waterius.waterius_api import key_prefix
 
 DEVICE_ID_PREFIX = "wb_mqtt_waterius"
 INTEGRATION_DEVICE_BASE = f"/devices/{DEVICE_ID_PREFIX}"
@@ -382,9 +382,9 @@ class PerKeyDevice(_PublishedDevice):
         )
 
     def _build_title(self) -> dict:
-        # Without a device name, fall back to a masked key prefix — the full key is a write
-        # credential and /devices/+/meta is readable by the whole LAN.
-        title_suffix = self._config_device.name or mask_key(self._config_device.key)
+        # Without a device name, fall back to the cut key — the full one is a write credential
+        # and /devices/+/meta is readable by the whole LAN.
+        title_suffix = self._config_device.name or f"{key_prefix(self._config_device.key)}*"
         return {"en": f"Waterius - {title_suffix}", "ru": f"Ватериус - {title_suffix}"}
 
     def _build_channels(self) -> None:

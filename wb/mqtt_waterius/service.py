@@ -41,7 +41,7 @@ from wb.mqtt_waterius.waterius_api import (
     ChannelData,
     WateriusClient,
     build_payload,
-    mask_key,
+    key_prefix,
 )
 
 CLIENT_ID = "wb-mqtt-waterius"
@@ -145,7 +145,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._last_schedule_run: Optional[tuple[str, int, int]] = None  # (date, hour, minute) already run
 
         self._state: State = load_state()
-        stamps = self._prune_sent_moments()
+        stamps = self._get_sent_stamps()
         self._enabled = self._state["enabled"]
 
         # client is injectable for tests and for the entry points that need a distinct id
@@ -159,24 +159,35 @@ class Service:  # pylint: disable=too-many-instance-attributes
             last_sent=stamps,
         )
 
-    def _prune_sent_moments(self) -> list[str]:
+    def _get_sent_stamps(self) -> list[str]:
         """
-        Drop the moments of devices no longer in the config, then persist what is left.
+        Display stamps of the configured devices in config order, empty where none.
+        """
+        return [
+            _display_stamp(self._state["last_sent"].get(key_hash(device.key)))
+            for device in self._config.devices
+        ]
+
+    def _prune_sent_moments(self) -> None:
+        """
+        Drop the moments of devices no longer in the config, in memory and on disk.
 
         A config edit restarts the service, so a key removed in the configurator takes its
-        moment out of the state file with it.
-
-        Returns:
-            Display stamps of the configured devices in config order, empty where none
+        moment out of the state file with it. A daemon start and a real send call this, the
+        constructor does not — it also runs on a config save and on a dry run.
         """
-        key_hashes = [key_hash(device.key) for device in self._config.devices]
-        kept = {
+        key_hashes = {key_hash(device.key) for device in self._config.devices}
+        configured_moments = {
             hashed_key: moment
             for hashed_key, moment in self._state["last_sent"].items()
             if hashed_key in key_hashes
         }
-        self._save_state_values(last_sent=kept)
-        return [_display_stamp(kept.get(hashed_key)) for hashed_key in key_hashes]
+        dropped = len(self._state["last_sent"]) - len(configured_moments)
+        if not dropped:
+            return
+        # A device that comes back the same day sends again, and the journal has to say why.
+        logger.info("Dropped %d sent marks of devices no longer in the config", dropped)
+        self._save_state_values(last_sent=configured_moments)
 
     def _apply_resting_state(self) -> None:
         """
@@ -329,10 +340,12 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
     def dry_run_payloads(self) -> bool:
         """
-        Build and log the payload of every configured device without sending anything.
+        Build and print the payload of every configured device without sending anything.
 
-        The cloud is not touched, the payloads only reach the log. What the command around this
-        method does touch is listed in run_once.
+        The cloud is not touched. Bodies go to the terminal so they can be replayed by hand,
+        while the journal gets the fact and the cut key — it is readable in the web UI and
+        travels in the diagnostic archive. What the command around this method does touch is
+        listed in run_once.
 
         Returns:
             True when every device had a full set of readings
@@ -344,14 +357,15 @@ class Service:  # pylint: disable=too-many-instance-attributes
         complete = True
 
         for device in self._config.devices:
-            key = mask_key(device.key)
+            key_label = f"{key_prefix(device.key)}*"
             readings, missing = self._get_snapshot(device)
             if missing:
-                logger.warning("Device %s: no data from channels: %s", key, ", ".join(missing))
+                logger.warning("Device %s: no data from channels: %s", key_label, ", ".join(missing))
                 complete = False
                 continue
-            payload = dict(build_payload(device.key, device.name, readings), key=key)
-            logger.info("[dry-run] Would POST to %s, payload %s", self._endpoint, payload)
+            payload = build_payload(device.key, device.name, readings)
+            print(f"[dry-run] Would POST to {self._endpoint}, payload {payload}")
+            logger.info("[dry-run] Device %s, %d channels ready", key_label, len(readings))
         return complete
 
     def _send_device(self, api: WateriusClient, index: int, device: Device) -> str:
@@ -366,22 +380,22 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Returns:
             One of SEND_OK, SEND_TRANSIENT (retry today), SEND_PERMANENT
         """
-        key = mask_key(device.key)
+        key_label = f"{key_prefix(device.key)}*"
         readings, missing = self._get_snapshot(device)
 
         if missing:
             detail = "No data from channels: " + ", ".join(missing)
-            logger.warning("Device %s: %s, skipping send", key, detail)
+            logger.warning("Device %s: %s, skipping send", key_label, detail)
             self._wb_devices.mark_device_failed(index, detail)
             return SEND_TRANSIENT  # the value may arrive later, so keep retrying today
 
         payload = build_payload(device.key, device.name, readings)
         # Handing over the stop event makes the retries interruptible, so a shutdown during
         # the linear backoff aborts the remaining attempts instead of blocking.
-        result = api.send(payload, stop_event=self._stop_event)
-        logger.info("Device %s, send result %s", key, result)
+        report = api.send(payload, stop_event=self._stop_event)
+        logger.info("Device %s, delivery %s", key_label, report)
 
-        if result.ok:
+        if report.ok:
             # Stamped when this device answered, not when the batch started, because devices
             # are sent one at a time and a retried one answers minutes later.
             now = self._datetime_now()
@@ -390,10 +404,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
             self._save_state_values(last_sent={**self._state["last_sent"], key_hash(device.key): moment})
             return SEND_OK
 
-        self._wb_devices.mark_device_failed(index, result.error or f"HTTP {result.status_code}")
+        self._wb_devices.mark_device_failed(index, report.error or f"HTTP {report.status_code}")
         # A 404 means the key is not registered, so retrying it today is pointless and it is
         # marked permanent. Any other failure (network, 503, non-404 HTTP) is transient.
-        return SEND_PERMANENT if result.status_code == KEY_NOT_FOUND_CODE else SEND_TRANSIENT
+        return SEND_PERMANENT if report.status_code == KEY_NOT_FOUND_CODE else SEND_TRANSIENT
 
     def _send_devices_data(self, indices: list[int]) -> tuple[set[int], set[int], bool]:
         """
@@ -598,6 +612,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._send_scheduled()
 
     def run(self) -> None:
+        self._prune_sent_moments()
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
 
@@ -646,9 +661,9 @@ class Service:  # pylint: disable=too-many-instance-attributes
         a value that has not arrived by then is reported instead of being picked up later.
 
         The command shares the devices and the state file with the daemon, in both modes. The
-        subscription mirrors the source values onto the key devices, the constructor rewrites
-        the state file when it prunes, and the outcome of a real send lands on the integration
-        device, so a manual send shows up on the card the same way a scheduled one does.
+        subscription mirrors the source values onto the key devices and the outcome of a real
+        send lands on the integration device, so a manual send shows up on the card the same way
+        a scheduled one does. A dry run touches neither the cloud nor the state file.
 
         Args:
             dry_run: build and log the payloads instead of posting them
@@ -656,6 +671,8 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Returns:
             True when every device was sent, or on a dry run had a full set of readings
         """
+        if not dry_run:
+            self._prune_sent_moments()
         connect_and_wait(self._client)
         self._subscribe_readings()
         ok = self.dry_run_payloads() if dry_run else self.send_now()
@@ -701,17 +718,21 @@ def _prepare_service(config_path: Optional[str], client: Optional[MQTTClient]) -
 
 
 def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] = None) -> int:
-    service = _prepare_service(config_path, client)
-    if service is None:
-        return EXIT_CONFIG_ERROR
+    service: Optional[Service] = None
 
     def _handle_stop(_signum: int, _frame: Optional[FrameType]) -> None:
         logger.info("Stopping")
+        if service is None:
+            raise SystemExit(EXIT_SUCCESS)
         service.stop_service()
 
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGHUP, _handle_stop)
+
+    service = _prepare_service(config_path, client)
+    if service is None:
+        return EXIT_CONFIG_ERROR
 
     try:
         service.run()

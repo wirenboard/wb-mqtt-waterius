@@ -160,7 +160,7 @@ def test_key_device_title_masks_key() -> None:
     client = FakeClient()
     _devices(client, config).create()
     meta = json.loads(client.last(f"{KEY_DEVICE1_BASE}/meta"))
-    assert meta["title"] == {"en": "Waterius - 01234", "ru": "Ватериус - 01234"}
+    assert meta["title"] == {"en": "Waterius - 01234*", "ru": "Ватериус - 01234*"}
 
 
 def test_key_device_title_prefers_device_name() -> None:

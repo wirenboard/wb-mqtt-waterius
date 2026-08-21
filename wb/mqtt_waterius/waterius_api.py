@@ -37,21 +37,21 @@ MAX_ERROR_LENGTH = 100
 logger = logging.getLogger(__name__)
 
 
-def mask_key(key: str) -> str:
+def key_prefix(key: str) -> str:
     """
-    Mask a Waterius key for logs and device titles.
+    First characters of a Waterius key, enough to tell devices apart in logs and titles.
 
-    A key is a cloud write credential, so it is never shown in full. Keys are 32-character
-    tokens and mask to their first 5 characters.
+    A key is a cloud write credential, so it is never shown in full. Callers mark the cut
+    with a star.
 
     Args:
         key: Waterius device key, non-empty — the config rejects a device without one
 
     Returns:
-        First characters of the key
+        First 5 characters of the key
 
     Examples:
-        >>> mask_key("0123456789abcdef0123456789abcdef")
+        >>> key_prefix("0123456789abcdef0123456789abcdef")
         '01234'
     """
     return key[:5]
@@ -76,9 +76,9 @@ class ChannelData:
 
 
 @dataclass(repr=False)
-class SendResult:
+class DeliveryReport:
     """
-    Outcome of a single POST to Waterius.
+    Outcome of one delivery to Waterius, retries included.
 
     Attributes:
         ok: whether Waterius accepted the request
@@ -92,23 +92,22 @@ class SendResult:
 
     def __repr__(self) -> str:
         if self.ok:
-            return f"SendResult(ok, http={self.status_code})"
-        return f"SendResult(failed, http={self.status_code}, error={self.error!r})"
+            return f"DeliveryReport(ok, http={self.status_code})"
+        return f"DeliveryReport(failed, http={self.status_code}, error={self.error!r})"
 
 
-def build_payload(key: str, name: str, channels: list[ChannelData]) -> dict[str, object]:
+def build_payload(device_key: str, name: str, channels: list[ChannelData]) -> dict[str, object]:
     """
     Build the JSON body for one Waterius device.
 
-    Waterius maps readings by channel number, so a device with a gap would write its
-    readings into the wrong slots of the cabinet. Every channel must therefore carry a
-    value, and one without a value is an error rather than something to skip. Keeping the
-    device out of the send is the caller's job.
+    The cabinet takes readings by channel number, so a gap would write them into the wrong
+    slots. A channel without a value is therefore an error, and keeping such a device out of
+    the send is the caller's job.
 
     Args:
-        key: Waterius device key
-        name: device name for the Waterius cabinet, may be empty
-        channels: readings to send, in ch0..ch3 order
+        device_key: Waterius device key, the write credential of one cabinet device
+        name: device name for the cabinet, empty keeps the name already set there
+        channels: values for ch0..ch3, in that order
 
     Returns:
         Request body as {"key": ..., "name": ..., "ch<N>": value, "data_type<N>": type,
@@ -121,16 +120,14 @@ def build_payload(key: str, name: str, channels: list[ChannelData]) -> dict[str,
         >>> build_payload("KEY", "Boiler", [ChannelData("d/c", 0, 0.1)])
         {'key': 'KEY', 'name': 'Boiler', 'ch0': 0.1, 'data_type0': 0}
 
-        An empty name keeps the name in the cabinet, and a channel serial is optional.
-
         >>> build_payload("K", "", [ChannelData("d/a", 0, 0.1, "1001"),
         ...                         ChannelData("d/b", 1, 0.2)])
         {'key': 'K', 'name': '', 'ch0': 0.1, 'data_type0': 0, 'serial0': '1001', 'ch1': 0.2, 'data_type1': 1}
     """
-    payload: dict[str, object] = {"key": key, "name": name}
+    payload: dict[str, object] = {"key": device_key, "name": name}
     for index, channel in enumerate(channels):
         if channel.value is None:
-            raise ValueError(f"device {mask_key(key)}: channel {channel.source} has no value")
+            raise ValueError(f"device {key_prefix(device_key)}*: channel {channel.source} has no value")
         payload[f"ch{index}"] = channel.value
         payload[f"data_type{index}"] = channel.data_type
         if channel.serial:
@@ -208,7 +205,9 @@ class WateriusClient:
         """
         self._session.close()
 
-    def send(self, payload: dict[str, object], stop_event: Optional[threading.Event] = None) -> SendResult:
+    def send(
+        self, payload: dict[str, object], stop_event: Optional[threading.Event] = None
+    ) -> DeliveryReport:
         """
         POST one device's readings to Waterius.
 
@@ -223,14 +222,15 @@ class WateriusClient:
                 so a shutdown aborts the remaining attempts at once
 
         Returns:
-            Outcome of the last attempt, with the status code and the failure reason when known
+            Outcome of the delivery, with the status code and the failure reason of the last
+            attempt when known
         """
         # Callers without a shutdown flag get a never-set event: waiting on it is a plain sleep.
         stop_event = stop_event or threading.Event()
         max_attempts = self.max_attempts
         # Holds the most recent failure, so the caller gets the real reason once the attempts run
         # out. Only the initial value survives if max_attempts is 0.
-        last_failure = SendResult(ok=False, error="no attempt made")
+        last_failure = DeliveryReport(ok=False, error="no attempt made")
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self._session.post(
@@ -241,18 +241,18 @@ class WateriusClient:
                 )
             except requests.RequestException as exc:
                 logger.warning("Send failed (attempt %d/%d): %s", attempt, max_attempts, exc)
-                last_failure = SendResult(ok=False, error=str(exc))
+                last_failure = DeliveryReport(ok=False, error=str(exc))
             else:
                 if 200 <= response.status_code < 300:
-                    return SendResult(ok=True, status_code=response.status_code)
+                    return DeliveryReport(ok=True, status_code=response.status_code)
                 if response.status_code not in RETRYABLE_STATUS_CODES:
                     if response.status_code == KEY_NOT_FOUND_CODE:
                         error = KEY_NOT_FOUND_ERROR
                     else:
                         error = _response_error(response)
                     logger.error("Waterius returned HTTP %s: %s", response.status_code, response.text[:200])
-                    return SendResult(ok=False, status_code=response.status_code, error=error)
-                last_failure = SendResult(ok=False, status_code=response.status_code)
+                    return DeliveryReport(ok=False, status_code=response.status_code, error=error)
+                last_failure = DeliveryReport(ok=False, status_code=response.status_code)
                 logger.warning(
                     "Waterius HTTP %s (attempt %d/%d), retrying", response.status_code, attempt, max_attempts
                 )

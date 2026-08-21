@@ -91,6 +91,13 @@ def _patch_send(monkeypatch: pytest.MonkeyPatch, send: Callable[..., Any]) -> No
     monkeypatch.setattr(service, "WateriusClient", lambda endpoint: FakeApi(send))
 
 
+def _explode_on_client(_endpoint: str) -> None:
+    """
+    Stand-in for WateriusClient that fails the test if a dry run tries to build one.
+    """
+    raise AssertionError("a dry run must not build a cloud client")
+
+
 def _patch_send_returning(monkeypatch: pytest.MonkeyPatch, ok: bool = True, status: int = 200) -> list[dict]:
     """
     Patch the cloud client with a send of one fixed outcome and collect what it was given.
@@ -105,9 +112,9 @@ def _patch_send_returning(monkeypatch: pytest.MonkeyPatch, ok: bool = True, stat
     """
     sent: list[dict] = []
 
-    def send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+    def send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.DeliveryReport:
         sent.append(payload)
-        return waterius_api.SendResult(ok, status)
+        return waterius_api.DeliveryReport(ok, status)
 
     _patch_send(monkeypatch, send)
     return sent
@@ -294,9 +301,9 @@ def test_send_now_one_device_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     service_instance, client = _service(config, values=_seeded_values(config))
 
-    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.DeliveryReport:
         ok = payload["key"] == "K1"
-        return waterius_api.SendResult(ok, 200 if ok else 503)
+        return waterius_api.DeliveryReport(ok, 200 if ok else 503)
 
     _patch_send(monkeypatch, fake_send)
     assert service_instance.send_now() is False
@@ -346,15 +353,22 @@ def test_send_now_no_devices() -> None:
 def test_dry_run_builds_no_client_and_has_no_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     # A dry run posts nothing, so it must not open a cloud client at all, and it leaves the
     # status devices and the persisted state exactly as they were.
-    def explode(_endpoint: str) -> None:
-        raise AssertionError("a dry run must not build a cloud client")
-
-    monkeypatch.setattr(service, "WateriusClient", explode)
+    monkeypatch.setattr(service, "WateriusClient", _explode_on_client)
     config = _config(Device("K1", [Channel("d/c", 0)]))
     service_instance, client = _service(config, values=_seeded_values(config))
     assert service_instance.dry_run_payloads() is True
     assert not service_instance._state["last_sent"]
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_sent") is None
+
+
+def test_a_dry_run_prints_the_body_it_would_post(capsys: pytest.CaptureFixture) -> None:
+    # The point of a dry run is a body that can be replayed by hand, so the printed one carries
+    # the real key. The journal, which travels in the diagnostic archive, gets the cut one.
+    key = "0123456789abcdef0123456789abcdef"
+    config = _config(Device(key, [Channel("d/c", 0)]))
+    service_instance, _ = _service(config, values=_seeded_values(config))
+    assert service_instance.dry_run_payloads() is True
+    assert key in capsys.readouterr().out
 
 
 def test_dry_run_reports_missing_readings() -> None:
@@ -662,9 +676,9 @@ def test_stale_device_timestamps_pruned() -> None:
     service_instance = service.Service(
         config, endpoint="http://test", datetime_now_fn=lambda: NOW, client=FakeClient()
     )
-    assert keep in service_instance._state["last_sent"]
-    assert stale not in service_instance._state["last_sent"]  # dropped on startup
-    assert state.load_state()["last_sent"] == {keep: kept_moment}  # rewritten to disk
+    service_instance._prune_sent_moments()
+    assert service_instance._state["last_sent"] == {keep: kept_moment}
+    assert state.load_state()["last_sent"] == {keep: kept_moment}  # written through
 
 
 def test_manual_send_ignores_todays_marks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -684,11 +698,11 @@ def test_send_now_permanent_404_holds_the_device(monkeypatch: pytest.MonkeyPatch
     config = _config(Device("K1", [Channel("d1/c", 0)]), Device("K2", [Channel("d2/c", 0)]))
     service_instance, client = _service(config, values=_seeded_values(config))
 
-    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.DeliveryReport:
         # Mirror the real send, a 404 carries the KEY_NOT_FOUND_ERROR message.
         if payload["key"] == "K1":
-            return waterius_api.SendResult(True, 200)
-        return waterius_api.SendResult(False, 404, waterius_api.KEY_NOT_FOUND_ERROR)
+            return waterius_api.DeliveryReport(True, 200)
+        return waterius_api.DeliveryReport(False, 404, waterius_api.KEY_NOT_FOUND_ERROR)
 
     _patch_send(monkeypatch, fake_send)
     assert service_instance.send_now() is False
@@ -708,11 +722,11 @@ def test_catch_up_resends_only_the_unsent_device(monkeypatch: pytest.MonkeyPatch
     calls = []
     fail_k2 = {"on": True}
 
-    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.DeliveryReport:
         calls.append(payload["key"])
         if payload["key"] == "K2" and fail_k2["on"]:
-            return waterius_api.SendResult(False, 503)
-        return waterius_api.SendResult(True, 200)
+            return waterius_api.DeliveryReport(False, 503)
+        return waterius_api.DeliveryReport(True, 200)
 
     _patch_send(monkeypatch, fake_send)
     service_instance.send_now()
@@ -748,11 +762,11 @@ def test_a_restart_resumes_the_device_left_unsent(monkeypatch: pytest.MonkeyPatc
     calls = []
     fail_k2 = {"on": True}
 
-    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.SendResult:
+    def fake_send(payload: dict, stop_event: Optional[threading.Event] = None) -> waterius_api.DeliveryReport:
         calls.append(payload["key"])
         if payload["key"] == "K2" and fail_k2["on"]:
-            return waterius_api.SendResult(False, 503)
-        return waterius_api.SendResult(True, 200)
+            return waterius_api.DeliveryReport(False, 503)
+        return waterius_api.DeliveryReport(True, 200)
 
     _patch_send(monkeypatch, fake_send)
     service_instance.send_now()
@@ -836,6 +850,7 @@ def test_main_daemon_config_error_reports_invalid_state(
     # the integration device is set to "Config Not Valid" so the web UI shows the dead state, not the
     # previous run's stale "Active".
     monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    monkeypatch.setattr(service, "signal", _FakeSignals())
     client = FakeClient()
     assert service.main_daemon(str(tmp_path / "nope.conf"), client=client) == service.EXIT_CONFIG_ERROR
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_CONFIG_INVALID)
@@ -880,13 +895,31 @@ def test_run_once_sends_and_returns_result(monkeypatch: pytest.MonkeyPatch) -> N
     assert service_instance.run_once() is True
 
 
+def test_a_real_send_writes_the_pruned_state_and_a_dry_run_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A dry run promises to change nothing, and rewriting the state file behind it would break
+    # that. The write belongs to the daemon start and to a real send.
+    stale = state.key_hash("OLD")
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    service_instance, _ = _service(
+        config,
+        values=_seeded_values(config),
+        stored_state={"last_sent": {stale: "2026-07-15T10:00:00"}},
+    )
+    monkeypatch.setattr(service, "WateriusClient", _explode_on_client)
+    assert service_instance.run_once(dry_run=True) is True
+    assert stale in state.load_state()["last_sent"]
+
+    _patch_send_returning(monkeypatch)  # replaces the exploding client, undo() would drop the env too
+    assert service_instance.run_once() is True
+    assert stale not in state.load_state()["last_sent"]
+
+
 def test_run_once_dry_run_prints_instead_of_posting(monkeypatch: pytest.MonkeyPatch) -> None:
     # The dry run and the real send differ by one ternary, and getting it backwards would post
     # real readings from a command that promises to only print them.
-    def explode(_endpoint: str) -> None:
-        raise AssertionError("a dry run must not build a cloud client")
-
-    monkeypatch.setattr(service, "WateriusClient", explode)
+    monkeypatch.setattr(service, "WateriusClient", _explode_on_client)
     config = _config(Device("K1", [Channel("d/c", 0)]))
     service_instance, client = _service(config, values=_seeded_values(config))
     assert service_instance.run_once(dry_run=True) is True
@@ -975,3 +1008,33 @@ def test_main_send_uses_distinct_client_id(tmp_path: Path, monkeypatch: pytest.M
     # A missing config takes the _report_config_error branch, which builds the fallback client.
     assert service.main_send_once(str(tmp_path / "nope.conf")) == service.EXIT_CONFIG_ERROR
     assert created["id"] == "wb-mqtt-waterius-send"
+
+
+def test_a_stop_during_startup_never_reaches_the_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The handlers go up before the config is read, so a stop that early ends the startup.
+    signals = _FakeSignals()
+    monkeypatch.setattr(service, "signal", signals)
+
+    def stop_while_loading(_path: Optional[str] = None) -> Any:
+        signals.handlers[signals.SIGINT](signals.SIGINT, None)
+        raise AssertionError("startup went on after the stop")
+
+    monkeypatch.setattr(service, "load_config", stop_while_loading)
+    with pytest.raises(SystemExit) as exit_info:
+        service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient())
+    assert exit_info.value.code == service.EXIT_SUCCESS
+
+
+def test_an_unchanged_state_file_is_not_rewritten(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every start and every manual send prunes, and a write with nothing to drop costs an eMMC
+    # block erase for no change at all.
+    config = _config(Device("K1", [Channel("d/c", 0)]))
+    service_instance, _ = _service(
+        config, stored_state={"last_sent": {state.key_hash("K1"): "2026-07-16T12:00:00"}}
+    )
+    writes: list[dict] = []
+    monkeypatch.setattr(service, "save_state", writes.append)
+    service_instance._prune_sent_moments()
+    assert not writes

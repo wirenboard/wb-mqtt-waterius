@@ -69,15 +69,17 @@ def _client(session: Any, **knobs: Any) -> waterius_api.WateriusClient:
 
 def test_build_payload_rejects_channel_without_value() -> None:
     # Waterius maps readings by channel number, so a device with a gap would write readings
-    # into the wrong slots. The daemon does not send such a device, and the body for it is
-    # not built either. The message names the device by its masked key and the channel by
-    # its topic, so the journal shows which device and which reading is missing.
+    # into the wrong slots. The body is not built at all, and the error names the channel that
+    # is empty without spelling out the key, which travels to the journal with the traceback.
+    key = "0123456789abcdef0123456789abcdef"
     channels = [
         waterius_api.ChannelData("d/a", 0, None),
         waterius_api.ChannelData("d/b", 1, 0.2),
     ]
-    with pytest.raises(ValueError, match="device 01234: channel d/a"):
-        waterius_api.build_payload("0123456789abcdef0123456789abcdef", "Boiler", channels)
+    with pytest.raises(ValueError) as failure:
+        waterius_api.build_payload(key, "Boiler", channels)
+    assert "d/a" in str(failure.value)
+    assert key not in str(failure.value)
 
 
 def test_send_success() -> None:

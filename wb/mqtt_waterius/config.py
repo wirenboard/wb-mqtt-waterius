@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
-from wb.mqtt_waterius.waterius_api import mask_key
+from wb.mqtt_waterius.waterius_api import key_prefix
 
 DEFAULT_PATH = "/etc/wb-mqtt-waterius.conf"
 TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
@@ -147,9 +147,9 @@ def _parse_device(raw_device: dict) -> Device:
         raise ConfigError("device has no key")
     channels = [_parse_channel(raw_channel) for raw_channel in raw_device.get("channels", [])]
     if not channels:
-        raise ConfigError(f"device {mask_key(key)!r} has no channels")
+        raise ConfigError(f"device {key_prefix(key)}* has no channels")
     if len(channels) > MAX_CHANNELS:
-        raise ConfigError(f"device {mask_key(key)!r} has {len(channels)} channels, max is {MAX_CHANNELS}")
+        raise ConfigError(f"device {key_prefix(key)}* has {len(channels)} channels, max is {MAX_CHANNELS}")
     name = raw_device.get("name") or ""
     return Device(key, channels, str(name).strip())
 
@@ -244,7 +244,7 @@ def parse_config(data: dict) -> Config:
     devices = [_parse_device(raw_device) for raw_device in raw_devices]
     duplicate = _find_duplicate_key(devices)
     if duplicate:
-        raise ConfigError(f"duplicate device key {mask_key(duplicate)!r}")
+        raise ConfigError(f"duplicate device key {key_prefix(duplicate)}*")
     return Config(send_time=send_time, devices=devices, days_of_week=_parse_days_of_week(data))
 
 

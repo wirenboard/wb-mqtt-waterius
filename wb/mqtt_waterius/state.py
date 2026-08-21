@@ -58,10 +58,17 @@ def load_state() -> State:
     try:
         with open(STATE_FILE, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except FileNotFoundError:
+        logger.info("No state file yet, starting with defaults")
+        data = {}
+    except ValueError as exc:
+        logger.warning("State file is not valid JSON, falling back to defaults: %s", exc)
+        data = {}
+    except OSError as exc:
         logger.warning("Cannot read state file, falling back to defaults: %s", exc)
         data = {}
     if not isinstance(data, dict):
+        logger.warning("State file is not a JSON object, falling back to defaults")
         data = {}
     state: State = {
         "enabled": bool(data.get("enabled", True)),
