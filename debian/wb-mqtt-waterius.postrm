@@ -3,9 +3,6 @@ set -e
 
 if [ "$1" = "purge" ]; then
     rm -rf /var/lib/wb-mqtt-waterius
-    # After wb_move the conffile is a symlink into /mnt/data, and dpkg removes the symlink only,
-    # so the real file goes explicitly.
-    rm -f /mnt/data/etc/wb-mqtt-waterius.conf
     rm -f /etc/wb-mqtt-waterius.conf.default
 fi
 
