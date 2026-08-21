@@ -37,24 +37,23 @@ MAX_ERROR_LENGTH = 100
 logger = logging.getLogger(__name__)
 
 
-def key_prefix(key: str) -> str:
+def short_key(key: str) -> str:
     """
-    First characters of a Waterius key, enough to tell devices apart in logs and titles.
+    Cut form of a Waterius key, enough to tell devices apart in logs, titles and errors.
 
-    A key is a cloud write credential, so it is never shown in full. Callers mark the cut
-    with a star.
+    A key is a cloud write credential, so it is never shown in full. The star marks the cut.
 
     Args:
         key: Waterius device key, non-empty — the config rejects a device without one
 
     Returns:
-        First 5 characters of the key
+        First 5 characters of the key and a star
 
     Examples:
-        >>> key_prefix("0123456789abcdef0123456789abcdef")
-        '01234'
+        >>> short_key("0123456789abcdef0123456789abcdef")
+        '01234*'
     """
-    return key[:5]
+    return key[:5] + "*"
 
 
 @dataclass(frozen=True)
@@ -127,7 +126,7 @@ def build_payload(device_key: str, name: str, channels: list[ChannelData]) -> di
     payload: dict[str, object] = {"key": device_key, "name": name}
     for index, channel in enumerate(channels):
         if channel.value is None:
-            raise ValueError(f"device {key_prefix(device_key)}*: channel {channel.source} has no value")
+            raise ValueError(f"device {short_key(device_key)}: channel {channel.source} has no value")
         payload[f"ch{index}"] = channel.value
         payload[f"data_type{index}"] = channel.data_type
         if channel.serial:

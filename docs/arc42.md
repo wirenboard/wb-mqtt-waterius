@@ -342,10 +342,11 @@ HTTP 404 — жёсткая ошибка «ключ не разрешён в у�
 не гарантия, что значение верно легло в кабинет** (единицы/каналы проверяются в кабинете или
 обратным API под токеном аккаунта). «Активен» означает «принято сервером».
 
-Ключ показывается обрезанным до первых пяти символов со звёздочкой в хвосте — `key_prefix`
-отдаёт обрезку, звёздочку ставит место вывода. У ключа короче пяти символов остаётся он сам
-(схема допускает `minLength: 1`, живые ключи Ватериуса — 32 символа). Так он выглядит в
-заголовках безымянных устройств (LAN-читаемый MQTT) и в логах. В самом конфиге
+Ключ показывается обрезанным до первых пяти символов со звёздочкой в хвосте, эту форму
+целиком отдаёт `short_key`, поэтому во всех местах вывода она одна и та же. У ключа короче
+пяти символов остаётся он сам плюс звёздочка (схема допускает `minLength: 1`, живые ключи
+Ватериуса — 32 символа). Так он выглядит в заголовках безымянных устройств (LAN-читаемый
+MQTT), в логах и в сообщениях об ошибках конфига. В самом конфиге
 `/etc/wb-mqtt-waterius.conf` ключ лежит открытым текстом (0644 conffile, норма confed-конфигов
 WB) — чтение требует локального доступа к контроллеру, не LAN. Единственное место, где
 credential лежит целиком, осознанно.
@@ -381,7 +382,7 @@ wb/mqtt_waterius/
 ├── main.py            # argparse, subcommands daemon/send/cleanup, флаг --version
 ├── version.py         # get_version (метадата) + parse_changelog_version/get_version_from_changelog
 ├── config.py          # Channel/Device/Config + parse_config/load_config
-├── waterius_api.py    # WateriusClient + build_payload/key_prefix, ChannelData/DeliveryReport
+├── waterius_api.py    # WateriusClient + build_payload/short_key, ChannelData/DeliveryReport
 ├── schedule.py        # чистые решения расписания — get_due_send_time/get_unsent_device_positions,
 │                     #   next_run/format_datetime для UI, WEEKDAY_NAMES
 ├── mqtt_device.py     # _PublishedDevice -> IntegrationDevice/PerKeyDevice, WateriusDevices,

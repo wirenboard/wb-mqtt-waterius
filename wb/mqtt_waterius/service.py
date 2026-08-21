@@ -41,7 +41,7 @@ from wb.mqtt_waterius.waterius_api import (
     ChannelData,
     WateriusClient,
     build_payload,
-    key_prefix,
+    short_key,
 )
 
 CLIENT_ID = "wb-mqtt-waterius"
@@ -357,7 +357,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         complete = True
 
         for device in self._config.devices:
-            key_label = f"{key_prefix(device.key)}*"
+            key_label = short_key(device.key)
             readings, missing = self._get_snapshot(device)
             if missing:
                 logger.warning("Device %s: no data from channels: %s", key_label, ", ".join(missing))
@@ -380,7 +380,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Returns:
             One of SEND_OK, SEND_TRANSIENT (retry today), SEND_PERMANENT
         """
-        key_label = f"{key_prefix(device.key)}*"
+        key_label = short_key(device.key)
         readings, missing = self._get_snapshot(device)
 
         if missing:
