@@ -633,7 +633,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._wb_devices.set_last_will()
         self._client.start()
         _wait_connected(self._connected_event, CONNECT_TIMEOUT, self._stop_event)
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() and not self._connected_event.is_set():
             self._client.stop()
             return
         self._log_startup()
