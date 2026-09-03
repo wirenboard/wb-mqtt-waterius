@@ -1037,7 +1037,7 @@ def test_a_stop_during_startup_never_reaches_the_service(
     assert exit_info.value.code == service.EXIT_NOT_RUNNING
 
 
-def test_the_daemon_exits_when_no_devices_are_configured(
+def test_the_daemon_clears_stale_topics_and_exits_when_no_devices_are_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "wb.conf").write_text(
@@ -1045,7 +1045,14 @@ def test_the_daemon_exits_when_no_devices_are_configured(
     )
     monkeypatch.setattr(service, "signal", _FakeSignals())
     monkeypatch.setattr(service.Service, "run", lambda self: pytest.fail("run() must not start"))
-    assert service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient()) == service.EXIT_NOT_RUNNING
+    monkeypatch.setattr(
+        "wb.mqtt_waterius.mqtt_device._scan_retained",
+        lambda *_args: [f"{INTEGRATION_BASE}/controls/state/meta/error"],
+    )
+    client = FakeClient()
+    assert service.main_daemon(str(tmp_path / "wb.conf"), client=client) == service.EXIT_NOT_RUNNING
+    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
+    assert client.stopped
 
 
 def test_an_unchanged_state_file_is_not_rewritten(monkeypatch: pytest.MonkeyPatch) -> None:

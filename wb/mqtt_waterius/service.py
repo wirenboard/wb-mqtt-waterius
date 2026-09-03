@@ -82,7 +82,7 @@ def _wait_connected(
     connected_event: threading.Event,
     timeout: int,
     stop_event: Optional[threading.Event] = None,
-) -> None:
+) -> bool:
     deadline = time.monotonic() + timeout
     while not connected_event.is_set() and (stop_event is None or not stop_event.is_set()):
         remaining = deadline - time.monotonic()
@@ -91,9 +91,10 @@ def _wait_connected(
         connected_event.wait(min(remaining, 0.1))
     if not connected_event.is_set() and (stop_event is None or not stop_event.is_set()):
         logger.warning("MQTT not connected within %ss, proceeding anyway", timeout)
+    return connected_event.is_set()
 
 
-def connect_and_wait(client: MQTTClient, timeout: int = CONNECT_TIMEOUT) -> None:
+def connect_and_wait(client: MQTTClient, timeout: int = CONNECT_TIMEOUT) -> bool:
     """
     Start the client and block until it is connected.
 
@@ -108,7 +109,7 @@ def connect_and_wait(client: MQTTClient, timeout: int = CONNECT_TIMEOUT) -> None
 
     client.on_connect = _on_connect
     client.start()
-    _wait_connected(connected_event, timeout)
+    return _wait_connected(connected_event, timeout)
 
 
 class Service:  # pylint: disable=too-many-instance-attributes
@@ -667,6 +668,26 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._stop_event.set()
         self._wake_event.set()
 
+    def clear_retained_devices(self) -> None:
+        """
+        Remove stale Waterius devices when a valid configuration contains no devices.
+
+        A preceding invalid configuration leaves an error card in MQTT on purpose. Once the
+        configuration is valid again, that card and any devices from an unclean stop must go
+        away even though the long-running part of the service has nothing to do.
+        """
+        try:
+            if not connect_and_wait(self._client):
+                logger.warning("Could not remove stale devices: MQTT broker is unavailable")
+                return
+            removed = self._wb_devices.clear()
+            if not wait_for_broker(self._client):
+                logger.warning("Broker did not confirm removing %d stale topics", len(removed))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Could not remove stale devices: %s", exc)
+        finally:
+            self._client.stop()
+
     def run_once(self, dry_run: bool = False) -> bool:
         """
         Connect, send once, disconnect. For manual use from the CLI.
@@ -750,6 +771,7 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
         return EXIT_CONFIG_ERROR
     if not service._config.devices:  # pylint: disable=protected-access
         logger.info("No devices configured, nothing to do")
+        service.clear_retained_devices()
         return EXIT_NOT_RUNNING
 
     try:
