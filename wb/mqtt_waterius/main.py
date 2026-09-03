@@ -60,13 +60,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("-c", "--config", help="path to config file", default=None)
     subparsers = parser.add_subparsers(dest="command")
     daemon_parser = subparsers.add_parser("daemon", help="run the service")
-    daemon_parser.add_argument(
-        "-c", "--config", help="path to config file", default=argparse.SUPPRESS
-    )
+    daemon_parser.add_argument("-c", "--config", help="path to config file", default=argparse.SUPPRESS)
     send_parser = subparsers.add_parser("send", help="send readings once and exit")
-    send_parser.add_argument(
-        "-c", "--config", help="path to config file", default=argparse.SUPPRESS
-    )
+    send_parser.add_argument("-c", "--config", help="path to config file", default=argparse.SUPPRESS)
     send_parser.add_argument(
         "--dry-run", action="store_true", help="build and print payloads without sending"
     )
