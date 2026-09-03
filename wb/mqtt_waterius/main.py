@@ -57,12 +57,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prog="wb-mqtt-waterius", description="Send WB meter readings to Waterius"
     )
     parser.add_argument("--version", action=_PrintVersionAction, help="show package version and exit")
-    parser.add_argument("-c", "--config", help="path to config file", default=None)
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", required=True)
     daemon_parser = subparsers.add_parser("daemon", help="run the service")
-    daemon_parser.add_argument("-c", "--config", help="path to config file", default=argparse.SUPPRESS)
+    daemon_parser.add_argument("-c", "--config", help="path to config file", default=None)
     send_parser = subparsers.add_parser("send", help="send readings once and exit")
-    send_parser.add_argument("-c", "--config", help="path to config file", default=argparse.SUPPRESS)
+    send_parser.add_argument("-c", "--config", help="path to config file", default=None)
     send_parser.add_argument(
         "--dry-run", action="store_true", help="build and print payloads without sending"
     )
@@ -70,7 +69,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _setup_logging()
     args = parser.parse_args(argv)
-    if args.command in (None, "daemon"):
+    if args.command == "daemon":
         return main_daemon(args.config)
     if args.command == "send":
         return main_send_once(args.config, dry_run=args.dry_run)
