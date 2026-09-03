@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/wb-mqtt-waterius
+ExecStart=/usr/bin/wb-mqtt-waterius daemon
 Restart=on-failure
 RestartSec=1
 TimeoutStopSec=30
