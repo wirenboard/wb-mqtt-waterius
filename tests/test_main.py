@@ -31,13 +31,11 @@ def dispatched_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
 @pytest.mark.parametrize(
     "argv, expected_command, expected_arguments, expected_code",
     [
-        (["daemon"], "daemon", {"config": None}, 4),
-        (["-c", "/tmp/w.conf", "daemon"], "daemon", {"config": "/tmp/w.conf"}, 4),
         (["send"], "send", {"config": None, "dry_run": False}, 3),
         (["-c", "/x", "send", "--dry-run"], "send", {"config": "/x", "dry_run": True}, 3),
         (["cleanup"], "cleanup", {"config": None}, 5),
     ],
-    ids=["daemon", "daemon_with_config", "send", "send_dry_run", "cleanup"],
+    ids=["send", "send_dry_run", "cleanup"],
 )
 def test_argv_dispatch(
     dispatched: dict,
@@ -53,3 +51,15 @@ def test_argv_dispatch(
 def test_no_command_starts_the_daemon(dispatched: dict) -> None:
     assert main.main([]) == 4
     assert dispatched == {"daemon": {"config": None}}
+
+
+def test_config_without_command_starts_the_daemon(dispatched: dict) -> None:
+    assert main.main(["-c", "/tmp/w.conf"]) == 4
+    assert dispatched == {"daemon": {"config": "/tmp/w.conf"}}
+
+
+def test_removed_daemon_command_is_rejected(dispatched: dict) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main.main(["daemon"])
+    assert exc_info.value.code == 2
+    assert dispatched == {}

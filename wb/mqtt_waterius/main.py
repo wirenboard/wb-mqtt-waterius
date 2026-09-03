@@ -59,7 +59,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--version", action=_PrintVersionAction, help="show package version and exit")
     parser.add_argument("-c", "--config", help="path to config file", default=None)
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("daemon", help="run the service")
     send_parser = subparsers.add_parser("send", help="send readings once and exit")
     send_parser.add_argument(
         "--dry-run", action="store_true", help="build and print payloads without sending"
@@ -68,7 +67,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _setup_logging()
     args = parser.parse_args(argv)
-    if args.command in (None, "daemon"):
+    if args.command is None:
         return main_daemon(args.config)
     if args.command == "send":
         return main_send_once(args.config, dry_run=args.dry_run)

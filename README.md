@@ -49,7 +49,6 @@
 ## Командная строка
 
 ```sh
-wb-mqtt-waterius daemon           # запуск сервиса (systemd делает это сам)
 wb-mqtt-waterius send             # разовая отправка сейчас и выход
 wb-mqtt-waterius send --dry-run   # собрать и вывести payload без отправки
 wb-mqtt-waterius --version        # версия установленного пакета

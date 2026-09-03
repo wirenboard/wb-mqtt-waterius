@@ -379,7 +379,7 @@ WB-устройство ключа — `Ватериус - <имя>`, а без 
 ```
 wb/mqtt_waterius/
 ├── __init__.py        # пустой, каталог пакета
-├── main.py            # argparse, subcommands daemon/send/cleanup, флаг --version
+├── main.py            # argparse, subcommands send/cleanup, флаг --version
 ├── version.py         # get_version (метадата) + parse_changelog_version/get_version_from_changelog
 ├── config.py          # Channel/Device/Config + parse_config/load_config
 ├── waterius_api.py    # WateriusClient + build_payload/short_key, ChannelData/DeliveryReport
@@ -471,11 +471,10 @@ main_daemon / main_send_once / main_cleanup — точки входа (exit-ко
 ### 5.4. Командная строка (main.py)
 
 Полный набор команд и флагов. В README вынесены только те, что нужны пользователю, —
-`daemon`, `send`, `send --dry-run` и `--version`.
+`send`, `send --dry-run` и `--version`.
 
 | Команда / флаг    | Что делает                                                                                                                                    |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemon`          | Запуск демона, этим занимается systemd-юнит                                                                                                   |
 | `send`            | Разовая отправка сейчас, игнорирует отметки за сегодня и переключатель                                                                        |
 | `send --dry-run`  | Собирает payload и печатает в терминал, в облако не ходит                                                                                                |
 | `cleanup`         | Снимает из MQTT устройства, оставшиеся от убитого сервиса, ручной инструмент. `EXIT_FAILURE`, если гашение упало или брокер его не подтвердил |
@@ -488,8 +487,8 @@ main_daemon / main_send_once / main_cleanup — точки входа (exit-ко
 сервис с конфига, который правит конфигуратор, и в обоих случаях ручной запуск пользователем
 чинит не проблему, а создаёт её.
 
-Без команды демон не стартует намеренно. Он бы занял MQTT-идентификатор работающего
-сервиса и выбил бы его с брокера.
+Без команды запускается демон; так его вызывает systemd-юнит. Отдельной подкоманды
+`daemon` нет.
 
 ---
 
