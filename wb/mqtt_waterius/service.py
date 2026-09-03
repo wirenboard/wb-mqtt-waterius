@@ -9,6 +9,7 @@ import datetime
 import logging
 import signal
 import threading
+import time
 from collections.abc import Callable
 from types import FrameType
 from typing import Any, Optional
@@ -65,6 +66,7 @@ SEND_PERMANENT = "permanent"
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG_ERROR = 6
+EXIT_NOT_RUNNING = 7
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +78,18 @@ def _display_stamp(moment: Optional[str]) -> str:
     return datetime.datetime.fromisoformat(moment).strftime(TIMESTAMP_FORMAT) if moment else ""
 
 
-def _wait_connected(connected_event: threading.Event, timeout: int) -> None:
-    if not connected_event.wait(timeout):
+def _wait_connected(
+    connected_event: threading.Event,
+    timeout: int,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not connected_event.is_set() and (stop_event is None or not stop_event.is_set()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        connected_event.wait(min(remaining, 0.1))
+    if not connected_event.is_set() and (stop_event is None or not stop_event.is_set()):
         logger.warning("MQTT not connected within %ss, proceeding anyway", timeout)
 
 
@@ -620,7 +632,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
         # Must come before the connection, paho only sends a will registered by then.
         self._wb_devices.set_last_will()
         self._client.start()
-        _wait_connected(self._connected_event, CONNECT_TIMEOUT)
+        _wait_connected(self._connected_event, CONNECT_TIMEOUT, self._stop_event)
+        if self._stop_event.is_set():
+            self._client.stop()
+            return
         self._log_startup()
 
         while not self._stop_event.is_set():
@@ -723,7 +738,7 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
     def _handle_stop(_signum: int, _frame: Optional[FrameType]) -> None:
         logger.info("Stopping")
         if service is None:
-            raise SystemExit(EXIT_SUCCESS)
+            raise SystemExit(EXIT_NOT_RUNNING)
         service.stop_service()
 
     signal.signal(signal.SIGTERM, _handle_stop)
@@ -733,6 +748,9 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
     service = _prepare_service(config_path, client)
     if service is None:
         return EXIT_CONFIG_ERROR
+    if not service._config.devices:  # pylint: disable=protected-access
+        logger.info("No devices configured, nothing to do")
+        return EXIT_NOT_RUNNING
 
     try:
         service.run()
@@ -740,7 +758,7 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
         logger.error("MQTT transport error: %s", exc)
         return EXIT_FAILURE
 
-    return EXIT_SUCCESS
+    return EXIT_NOT_RUNNING
 
 
 def main_send_once(

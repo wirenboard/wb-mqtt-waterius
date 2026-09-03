@@ -814,14 +814,16 @@ def test_the_daemon_stops_on_every_signal_it_takes(tmp_path: Path, monkeypatch: 
     # SIGHUP is a stop here, not the config reload the convention suggests, so the whole set is
     # worth pinning. Each handler has to reach stop_service, which is what ends the poll loop.
     (tmp_path / "wb.conf").write_text(
-        '{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8"
+        '{"sendTime": "03:00", "daysOfWeek": ["monday"], '
+        '"devices": [{"key": "K1", "channels": [{"mqttTopicName": "d/c", "dataType": 0}]}]}',
+        encoding="utf-8",
     )
     signals = _FakeSignals()
     monkeypatch.setattr(service, "signal", signals)
     started: dict[str, service.Service] = {}
     monkeypatch.setattr(service.Service, "run", lambda self: started.setdefault("service", self))
 
-    assert service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient()) == service.EXIT_SUCCESS
+    assert service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient()) == service.EXIT_NOT_RUNNING
     assert set(signals.handlers) == {signals.SIGTERM, signals.SIGINT, signals.SIGHUP}
     for signum, handler in signals.handlers.items():
         started["service"]._stop_event.clear()
@@ -893,6 +895,14 @@ def test_run_once_sends_and_returns_result(monkeypatch: pytest.MonkeyPatch) -> N
     service_instance, _ = _service(config, values=_seeded_values(config))
     _patch_send_returning(monkeypatch)
     assert service_instance.run_once() is True
+
+
+def test_stop_interrupts_the_initial_connection_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])))
+    monkeypatch.setattr(client, "start", lambda: None)
+    service_instance.stop_service()
+    service_instance.run()
+    assert client.stopped
 
 
 def test_a_real_send_writes_the_pruned_state_and_a_dry_run_does_not(
@@ -1024,7 +1034,18 @@ def test_a_stop_during_startup_never_reaches_the_service(
     monkeypatch.setattr(service, "load_config", stop_while_loading)
     with pytest.raises(SystemExit) as exit_info:
         service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient())
-    assert exit_info.value.code == service.EXIT_SUCCESS
+    assert exit_info.value.code == service.EXIT_NOT_RUNNING
+
+
+def test_the_daemon_exits_when_no_devices_are_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "wb.conf").write_text(
+        '{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8"
+    )
+    monkeypatch.setattr(service, "signal", _FakeSignals())
+    monkeypatch.setattr(service.Service, "run", lambda self: pytest.fail("run() must not start"))
+    assert service.main_daemon(str(tmp_path / "wb.conf"), client=FakeClient()) == service.EXIT_NOT_RUNNING
 
 
 def test_an_unchanged_state_file_is_not_rewritten(monkeypatch: pytest.MonkeyPatch) -> None:

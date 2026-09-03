@@ -68,15 +68,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _setup_logging()
     args = parser.parse_args(argv)
-    if args.command == "daemon":
+    if args.command in (None, "daemon"):
         return main_daemon(args.config)
     if args.command == "send":
         return main_send_once(args.config, dry_run=args.dry_run)
     if args.command == "cleanup":
         return main_cleanup()
-    # Without a command print the help. Starting the daemon here would take the running
-    # service's MQTT client id and knock it off the broker.
-    parser.print_help()
     return EXIT_FAILURE
 
 

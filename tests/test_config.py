@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 
@@ -152,6 +152,28 @@ def test_load_config_broken_json_raises(tmp_path: Path) -> None:
     path.write_text('{"sendTime": "03:00",}', encoding="utf-8")
     with pytest.raises(config.ConfigError):
         config.load_config(str(path))
+
+
+def test_load_config_directory_raises_config_error(tmp_path: Path) -> None:
+    with pytest.raises(config.ConfigError):
+        config.load_config(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [],
+        {"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": [1]},
+        {
+            "sendTime": "03:00",
+            "daysOfWeek": ["monday"],
+            "devices": [{"key": "K", "channels": [1]}],
+        },
+    ],
+)
+def test_wrong_container_types_raise_config_error(data: Any) -> None:
+    with pytest.raises(config.ConfigError):
+        config.parse_config(data)
 
 
 def test_channel_serial_optional() -> None:

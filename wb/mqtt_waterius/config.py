@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from wb.mqtt_waterius.waterius_api import short_key
 
@@ -115,9 +115,11 @@ class Config:
         return topics
 
 
-def _parse_channel(raw_channel: dict) -> Channel:
+def _parse_channel(raw_channel: Any) -> Channel:
+    if not isinstance(raw_channel, dict):
+        raise ConfigError("each channel must be an object")
     source = raw_channel.get("mqttTopicName")
-    if not source or "/" not in source:
+    if not isinstance(source, str) or "/" not in source:
         raise ConfigError(f"channel mqttTopicName must be 'device/control', got {source!r}")
     if "dataType" not in raw_channel:
         raise ConfigError(f"channel {source!r} has no dataType")
@@ -141,11 +143,16 @@ def _parse_channel(raw_channel: dict) -> Channel:
     return Channel(source, data_type, serial)
 
 
-def _parse_device(raw_device: dict) -> Device:
+def _parse_device(raw_device: Any) -> Device:
+    if not isinstance(raw_device, dict):
+        raise ConfigError("each device must be an object")
     key = raw_device.get("key")
-    if not key:
+    if not isinstance(key, str) or not key:
         raise ConfigError("device has no key")
-    channels = [_parse_channel(raw_channel) for raw_channel in raw_device.get("channels", [])]
+    raw_channels = raw_device.get("channels", [])
+    if not isinstance(raw_channels, list):
+        raise ConfigError(f"device {short_key(key)} channels must be an array")
+    channels = [_parse_channel(raw_channel) for raw_channel in raw_channels]
     if not channels:
         raise ConfigError(f"device {short_key(key)} has no channels")
     if len(channels) > MAX_CHANNELS:
@@ -213,7 +220,7 @@ def _parse_days_of_week(data: dict) -> set[int]:
     return days
 
 
-def parse_config(data: dict) -> Config:
+def parse_config(data: Any) -> Config:
     """
     Build a Config from a plain dict, the already-parsed JSON of the config file.
 
@@ -236,11 +243,13 @@ def parse_config(data: dict) -> Config:
         >>> config.devices[0].name, config.devices[0].channels[0].mqtt_topic
         ('Boiler', '/devices/wb-map12/controls/ch1')
     """
+    if not isinstance(data, dict):
+        raise ConfigError("configuration root must be an object")
     send_time = _parse_send_time(data)
     raw_devices = data.get("devices")
     if not isinstance(raw_devices, list):
         raise ConfigError("devices is required, use an empty list when nothing is configured")
-    # An empty list is the fresh-install state, the daemon idles instead of crash-looping.
+    # An empty list is the valid fresh-install state; the daemon exits without starting MQTT.
     devices = [_parse_device(raw_device) for raw_device in raw_devices]
     duplicate = _find_duplicate_key(devices)
     if duplicate:
@@ -259,8 +268,10 @@ def load_config(path: Optional[str] = None) -> Config:
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+    except UnicodeError as exc:
+        raise ConfigError(f"invalid text encoding in {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
     return parse_config(data)

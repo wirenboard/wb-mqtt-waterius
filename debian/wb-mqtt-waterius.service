@@ -8,11 +8,12 @@ Type=simple
 User=root
 ExecStart=/usr/bin/wb-mqtt-waterius daemon
 Restart=on-failure
-RestartSec=30
+RestartSec=1
 TimeoutStopSec=30
 # A config error exits 6: stop cleanly instead of crash-looping. Saving a fixed
 # config in the web UI makes confed restart the service.
-RestartPreventExitStatus=6
+RestartPreventExitStatus=2 6
+SuccessExitStatus=7
 
 [Install]
 WantedBy=multi-user.target
