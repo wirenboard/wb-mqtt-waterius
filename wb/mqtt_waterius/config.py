@@ -116,6 +116,8 @@ class Config:
 
 
 def _parse_channel(raw_channel: dict) -> Channel:
+    if not isinstance(raw_channel, dict):
+        raise ConfigError(f"channel must be an object, got {raw_channel!r}")
     source = raw_channel.get("mqttTopicName")
     if not source or "/" not in source:
         raise ConfigError(f"channel mqttTopicName must be 'device/control', got {source!r}")
@@ -142,6 +144,8 @@ def _parse_channel(raw_channel: dict) -> Channel:
 
 
 def _parse_device(raw_device: dict) -> Device:
+    if not isinstance(raw_device, dict):
+        raise ConfigError(f"device must be an object, got {raw_device!r}")
     key = raw_device.get("key")
     if not key:
         raise ConfigError("device has no key")
@@ -236,6 +240,8 @@ def parse_config(data: dict) -> Config:
         >>> config.devices[0].name, config.devices[0].channels[0].mqtt_topic
         ('Boiler', '/devices/wb-map12/controls/ch1')
     """
+    if not isinstance(data, dict):
+        raise ConfigError("the config must be a JSON object")
     send_time = _parse_send_time(data)
     raw_devices = data.get("devices")
     if not isinstance(raw_devices, list):
@@ -259,8 +265,8 @@ def load_config(path: Optional[str] = None) -> Config:
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
     return parse_config(data)

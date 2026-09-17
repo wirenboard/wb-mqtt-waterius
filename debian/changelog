@@ -1,3 +1,15 @@
+wb-mqtt-waterius (1.1.0) stable; urgency=medium
+
+  * Exit with 7 when no devices are configured, without publishing a config error
+  * Exit with 6 on every config read or parse error, with 2 on bad arguments;
+    -c belongs to the daemon and send commands
+  * Wait for an unavailable MQTT broker instead of exiting; exit with 2 when the
+    broker rejects the login
+  * Report when the retained topics cannot be removed at stop because the broker
+    is not connected; RestartSec=1, no restart on 2 and 6, 7 is a success
+
+ -- Ekaterina Volkova <ekaterina.volkova@wirenboard.com>  Thu, 17 Sep 2026 16:11:39 +0000
+
 wb-mqtt-waterius (1.0.0) stable; urgency=medium
 
   * Initial release.
