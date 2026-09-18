@@ -63,6 +63,7 @@ class FakeClient:  # pylint: disable=too-many-instance-attributes  # a test doub
         self.will: Optional[tuple] = None
         self.will_at_connect: Optional[tuple] = None
         self.published_at_stop: Optional[int] = None
+        self.retry_first_connection: Optional[bool] = None  # what start() was called with
         self.connected = True  # flipped by the tests that model a broker that is down
 
     @property
@@ -96,7 +97,7 @@ class FakeClient:  # pylint: disable=too-many-instance-attributes  # a test doub
         # armed by then. Then simulate the broker's CONNACK (paho fires on_connect on the network
         # thread), unless the test models a broker that is down: then paho keeps retrying and the
         # service waits on its stop event.
-        del retry_first_connection
+        self.retry_first_connection = retry_first_connection
         self.will_at_connect = self.will
         if self.connected:
             self.connack()
