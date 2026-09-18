@@ -93,11 +93,13 @@ class FakeClient:  # pylint: disable=too-many-instance-attributes  # a test doub
 
     def start(self, retry_first_connection: bool = False) -> None:
         # Real paho sends only the will registered before the connection, so remember what was
-        # armed by then. Then simulate the broker's CONNACK, otherwise a caller waiting on the
-        # connection event would block. Real paho fires on_connect on the network thread.
+        # armed by then. Then simulate the broker's CONNACK (paho fires on_connect on the network
+        # thread), unless the test models a broker that is down: then paho keeps retrying and the
+        # service waits on its stop event.
         del retry_first_connection
         self.will_at_connect = self.will
-        self.connack()
+        if self.connected:
+            self.connack()
 
     def connack(self, rc: int = 0) -> None:
         """
