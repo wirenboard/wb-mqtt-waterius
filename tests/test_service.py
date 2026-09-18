@@ -1053,11 +1053,13 @@ def test_run_waits_for_the_broker_before_the_first_poll(monkeypatch: pytest.Monk
     assert not thread.is_alive()
 
 
-def test_run_lets_paho_retry_the_first_connection() -> None:
+def test_run_lets_paho_retry_the_first_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    started_with: dict = {}
+    monkeypatch.setattr(client, "start", lambda **kwargs: started_with.update(kwargs))
     service_instance._stop_event.set()
     service_instance.run()
-    assert client.retry_first_connection is True
+    assert started_with == {"retry_first_connection": True}
 
 
 @pytest.mark.parametrize("rc", service.MQTT_AUTH_ERRORS)
