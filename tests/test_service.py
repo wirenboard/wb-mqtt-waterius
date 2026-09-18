@@ -414,7 +414,6 @@ def test_await_readings(
 def test_on_connect_requests_full_resetup() -> None:
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
     service_instance._on_connect(None, None, None, 0)
-    assert service_instance._connected_event.is_set()
     assert service_instance._resetup_event.is_set()  # every (re)connect asks the loop to re-publish devices
     assert service_instance._wake_event.is_set()  # and wakes the poll sleep so it happens at once
 
@@ -423,7 +422,6 @@ def test_on_connect_failure_skips_resetup() -> None:
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
     service_instance._on_connect(None, None, None, 1)
     assert not service_instance._resetup_event.is_set()
-    assert not service_instance._connected_event.is_set()
 
 
 def test_setup_mqtt_republishes_devices_after_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -505,7 +503,6 @@ def test_the_scheduled_fire_moves_next_execution(monkeypatch: pytest.MonkeyPatch
 def test_run_loop_applies_resetup_then_stops(monkeypatch: pytest.MonkeyPatch) -> None:
     # The reconnect glue, run()'s loop must see the event, clear it and call _setup_mqtt.
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
-    service_instance._connected_event.set()  # skip the initial connect wait
     service_instance._resetup_event.set()
     calls = []
 
@@ -525,7 +522,6 @@ def test_run_arms_the_last_will_before_connecting_and_stops_the_client() -> None
     # stopping the client leaves the socket to the garbage collector.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
     service_instance._stop_event.set()  # one pass through the loop and out
-    service_instance._connected_event.set()
     service_instance.run()
     assert client.will_at_connect == (f"{INTEGRATION_BASE}/controls/state/meta/error", "rw", True)
     assert client.stopped
@@ -537,7 +533,6 @@ def test_stop_removes_the_devices_while_the_client_is_still_up() -> None:
     # paho drops whatever is still on the way.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
     service_instance._stop_event.set()  # one pass through the loop and out
-    service_instance._connected_event.set()
     service_instance.run()
     assert client.last(f"{KEY_DEVICE1_BASE}/meta") == ""
     assert client.last(f"{INTEGRATION_BASE}/meta") == ""
@@ -562,7 +557,6 @@ def test_stop_drops_the_source_subscriptions_before_the_wipe(monkeypatch: pytest
             publish(source, "5")  # the source updates in the middle of the removal
 
     monkeypatch.setattr(client, "publish", publish_racing_a_reading)
-    service_instance._connected_event.set()
     service_instance._remove_devices()
     assert client.last(channel_topic) == ""
     assert source not in client.subscribed
@@ -572,7 +566,6 @@ def test_stop_survives_a_broker_that_fails_mid_removal(monkeypatch: pytest.Monke
     # Removal is the last thing a clean stop does, so a broker failing there can only be
     # reported. The bare call is the assertion, an exception would end the stop in a traceback.
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
-    service_instance._connected_event.set()
 
     def broken_removal() -> list[str]:
         raise RuntimeError("broker went away")
@@ -1043,6 +1036,7 @@ def test_run_waits_for_the_broker_before_the_first_poll(monkeypatch: pytest.Monk
     # paho's queue until the broker answers, and the first pass follows the CONNACK.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
     monkeypatch.setattr(client, "start", lambda retry_first_connection=False: None)  # no CONNACK yet
+    client.connected = False
     polled = threading.Event()
 
     def poll_once_then_stop() -> None:

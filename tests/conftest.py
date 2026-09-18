@@ -2,6 +2,8 @@
 Fakes shared by the tests.
 """
 
+import threading
+import time
 from collections.abc import Callable
 from typing import Any, Optional, Union
 
@@ -101,10 +103,19 @@ class FakeClient:  # pylint: disable=too-many-instance-attributes  # a test doub
         """
         Deliver the broker's CONNACK to the registered callback, the way paho's network thread does.
         """
+        self.connected = rc == 0
         if self.on_connect is not None:
             self.on_connect(self, None, {}, rc)
 
     def is_connected(self) -> bool:
+        return self.connected
+
+    def wait_for_connection(self, stop_requested: Optional[threading.Event] = None) -> bool:
+        """
+        Like wb-common's: block until connected or the stop event is set.
+        """
+        while not self.connected and not (stop_requested is not None and stop_requested.is_set()):
+            time.sleep(0.01)
         return self.connected
 
     def stop(self) -> None:

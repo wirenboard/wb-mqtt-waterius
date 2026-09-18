@@ -139,7 +139,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._state_lock = threading.Lock()  # serializes state mutation and save across threads
 
         self._stop_event = threading.Event()
-        self._connected_event = threading.Event()  # set once the first CONNACK arrives
         self._resetup_event = threading.Event()  # set on every (re)connect, re-publish devices
         self._toggle_event = threading.Event()  # set by the switch, the loop republishes the status
         self._wake_event = threading.Event()  # interrupts the poll sleep (reconnect or stop)
@@ -573,7 +572,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
                 self._login_rejected = True
                 self.stop_service()
             return
-        self._connected_event.set()
         self._resetup_event.set()
         self._wake_event.set()
 
@@ -638,9 +636,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
         # Must come before the connection, paho only sends a will registered by then.
         self._wb_devices.set_last_will()
         # An unavailable broker is retried by paho's network thread; the poll loop starts on a
-        # live connection, so nothing piles up in paho's queue meanwhile.
+        # live connection, so nothing piles up in paho's queue meanwhile. A signal or a rejected
+        # login sets the stop event and ends the wait early.
         self._client.start(retry_first_connection=True)
-        self._await_connection()
+        self._client.wait_for_connection(self._stop_event)
         self._log_startup()
 
         while not self._stop_event.is_set():
@@ -650,14 +649,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
         self._remove_devices()
         self._client.stop()
-
-    def _await_connection(self) -> None:
-        """
-        Block until the first CONNACK or a stop request, whichever comes first.
-        """
-        while not self._connected_event.is_set() and not self._stop_event.is_set():
-            self._wake_event.wait()  # set by _on_connect and by stop_service
-            self._wake_event.clear()
 
     def _remove_devices(self) -> None:
         """
