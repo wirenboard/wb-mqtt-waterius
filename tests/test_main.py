@@ -32,9 +32,9 @@ def dispatched_fixture(monkeypatch: pytest.MonkeyPatch) -> dict:
     "argv, expected_command, expected_arguments, expected_code",
     [
         (["daemon"], "daemon", {"config": None}, 4),
-        (["-c", "/tmp/w.conf", "daemon"], "daemon", {"config": "/tmp/w.conf"}, 4),
+        (["daemon", "-c", "/tmp/w.conf"], "daemon", {"config": "/tmp/w.conf"}, 4),
         (["send"], "send", {"config": None, "dry_run": False}, 3),
-        (["-c", "/x", "send", "--dry-run"], "send", {"config": "/x", "dry_run": True}, 3),
+        (["send", "-c", "/x", "--dry-run"], "send", {"config": "/x", "dry_run": True}, 3),
         (["cleanup"], "cleanup", {"config": None}, 5),
     ],
     ids=["daemon", "daemon_with_config", "send", "send_dry_run", "cleanup"],
@@ -52,7 +52,16 @@ def test_argv_dispatch(
 
 def test_no_command_prints_help(dispatched: dict, capsys: pytest.CaptureFixture) -> None:
     # Starting the daemon without a command would take the running service's client id, so main()
-    # prints help and fails instead of picking a default.
-    assert main.main([]) == 1
+    # prints help and fails with the bad-arguments code instead of picking a default.
+    assert main.main([]) == 2
     assert "usage: wb-mqtt-waterius" in capsys.readouterr().out
+    assert not dispatched
+
+
+@pytest.mark.parametrize("argv", [["-c", "/x", "daemon"], ["cleanup", "-c", "/x"]], ids=["before", "cleanup"])
+def test_config_belongs_to_daemon_and_send_only(dispatched: dict, argv: list[str]) -> None:
+    # -c goes after the command it configures; cleanup finds its devices in the broker and takes none.
+    with pytest.raises(SystemExit) as exit_info:
+        main.main(argv)
+    assert exit_info.value.code == 2
     assert not dispatched

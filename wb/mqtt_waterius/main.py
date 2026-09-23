@@ -12,6 +12,7 @@ from typing import Any, Optional
 from wb.mqtt_waterius.service import (
     CLIENT_ID,
     EXIT_FAILURE,
+    EXIT_INVALIDARGUMENT,
     main_cleanup,
     main_daemon,
     main_send_once,
@@ -57,13 +58,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prog="wb-mqtt-waterius", description="Send WB meter readings to Waterius"
     )
     parser.add_argument("--version", action=_PrintVersionAction, help="show package version and exit")
-    parser.add_argument("-c", "--config", help="path to config file", default=None)
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("daemon", help="run the service")
+    daemon_parser = subparsers.add_parser("daemon", help="run the service")
     send_parser = subparsers.add_parser("send", help="send readings once and exit")
     send_parser.add_argument(
         "--dry-run", action="store_true", help="build and print payloads without sending"
     )
+    # cleanup takes no config: it finds the devices in the broker
+    for command_parser in (daemon_parser, send_parser):
+        command_parser.add_argument("-c", "--config", help="path to config file", default=None)
     subparsers.add_parser("cleanup", help="remove all Waterius devices from MQTT")
 
     _setup_logging()
@@ -77,7 +80,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Without a command print the help. Starting the daemon here would take the running
     # service's MQTT client id and knock it off the broker.
     parser.print_help()
-    return EXIT_FAILURE
+    return EXIT_INVALIDARGUMENT
 
 
 if __name__ == "__main__":

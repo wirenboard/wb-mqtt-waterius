@@ -193,3 +193,23 @@ def test_channel_serial_too_long() -> None:
     at_the_limit = "1" * config.MAX_SERIAL_LENGTH
     data["devices"][0]["channels"][0]["serial"] = at_the_limit
     assert config.parse_config(data).devices[0].channels[0].serial == at_the_limit
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"[]", b'{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": ["K1"]}', b"\xff\xfe not utf-8"],
+    ids=["not-an-object", "device-not-an-object", "not-utf8"],
+)
+def test_load_config_unusable_content_raises(tmp_path: Path, content: bytes) -> None:
+    # Every way a hand-edited file can go wrong ends in the one ConfigError the daemon maps to
+    # exit code 6, never in a traceback.
+    path = tmp_path / "wb-mqtt-waterius.conf"
+    path.write_bytes(content)
+    with pytest.raises(config.ConfigError):
+        config.load_config(str(path))
+
+
+def test_load_config_unreadable_path_raises(tmp_path: Path) -> None:
+    # A directory where the file should be is an OSError other than "not found".
+    with pytest.raises(config.ConfigError):
+        config.load_config(str(tmp_path))

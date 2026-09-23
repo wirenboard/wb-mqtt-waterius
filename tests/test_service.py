@@ -414,7 +414,6 @@ def test_await_readings(
 def test_on_connect_requests_full_resetup() -> None:
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
     service_instance._on_connect(None, None, None, 0)
-    assert service_instance._connected_event.is_set()
     assert service_instance._resetup_event.is_set()  # every (re)connect asks the loop to re-publish devices
     assert service_instance._wake_event.is_set()  # and wakes the poll sleep so it happens at once
 
@@ -423,7 +422,6 @@ def test_on_connect_failure_skips_resetup() -> None:
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
     service_instance._on_connect(None, None, None, 1)
     assert not service_instance._resetup_event.is_set()
-    assert not service_instance._connected_event.is_set()
 
 
 def test_setup_mqtt_republishes_devices_after_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -505,7 +503,6 @@ def test_the_scheduled_fire_moves_next_execution(monkeypatch: pytest.MonkeyPatch
 def test_run_loop_applies_resetup_then_stops(monkeypatch: pytest.MonkeyPatch) -> None:
     # The reconnect glue, run()'s loop must see the event, clear it and call _setup_mqtt.
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
-    service_instance._connected_event.set()  # skip the initial connect wait
     service_instance._resetup_event.set()
     calls = []
 
@@ -525,7 +522,6 @@ def test_run_arms_the_last_will_before_connecting_and_stops_the_client() -> None
     # stopping the client leaves the socket to the garbage collector.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
     service_instance._stop_event.set()  # one pass through the loop and out
-    service_instance._connected_event.set()
     service_instance.run()
     assert client.will_at_connect == (f"{INTEGRATION_BASE}/controls/state/meta/error", "rw", True)
     assert client.stopped
@@ -537,7 +533,6 @@ def test_stop_removes_the_devices_while_the_client_is_still_up() -> None:
     # paho drops whatever is still on the way.
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
     service_instance._stop_event.set()  # one pass through the loop and out
-    service_instance._connected_event.set()
     service_instance.run()
     assert client.last(f"{KEY_DEVICE1_BASE}/meta") == ""
     assert client.last(f"{INTEGRATION_BASE}/meta") == ""
@@ -562,7 +557,6 @@ def test_stop_drops_the_source_subscriptions_before_the_wipe(monkeypatch: pytest
             publish(source, "5")  # the source updates in the middle of the removal
 
     monkeypatch.setattr(client, "publish", publish_racing_a_reading)
-    service_instance._connected_event.set()
     service_instance._remove_devices()
     assert client.last(channel_topic) == ""
     assert source not in client.subscribed
@@ -572,7 +566,6 @@ def test_stop_survives_a_broker_that_fails_mid_removal(monkeypatch: pytest.Monke
     # Removal is the last thing a clean stop does, so a broker failing there can only be
     # reported. The bare call is the assertion, an exception would end the stop in a traceback.
     service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
-    service_instance._connected_event.set()
 
     def broken_removal() -> list[str]:
         raise RuntimeError("broker went away")
@@ -602,9 +595,9 @@ def test_a_crash_leaves_the_devices_on_the_broker(monkeypatch: pytest.MonkeyPatc
 def test_stop_without_a_connection_publishes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     # Never connected means nothing of ours reached the broker, so there is nothing to remove and
     # no reason to wait out the confirmation timeout on the way down.
-    monkeypatch.setattr(service, "CONNECT_TIMEOUT", 0)
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
-    monkeypatch.setattr(client, "start", lambda: None)  # no CONNACK, so no connected event
+    monkeypatch.setattr(client, "start", lambda retry_first_connection=False: None)  # no CONNACK
+    client.connected = False
     service_instance._stop_event.set()
     service_instance.run()
     assert not client.published
@@ -813,9 +806,7 @@ def test_a_source_value_arrives_through_the_client() -> None:
 def test_the_daemon_stops_on_every_signal_it_takes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # SIGHUP is a stop here, not the config reload the convention suggests, so the whole set is
     # worth pinning. Each handler has to reach stop_service, which is what ends the poll loop.
-    (tmp_path / "wb.conf").write_text(
-        '{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8"
-    )
+    _write_valid_config(tmp_path / "wb.conf")
     signals = _FakeSignals()
     monkeypatch.setattr(service, "signal", signals)
     started: dict[str, service.Service] = {}
@@ -927,22 +918,21 @@ def test_run_once_dry_run_prints_instead_of_posting(monkeypatch: pytest.MonkeyPa
     assert not service_instance._state["last_sent"]  # nothing was sent, so nothing was stamped
 
 
-@pytest.mark.parametrize("entry_point", [service.main_daemon, service.main_send_once], ids=["daemon", "send"])
-def test_an_unreachable_broker_is_reported_not_raised(
-    entry_point: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_an_unreachable_broker_is_reported_not_raised_by_a_manual_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # After= only orders the start, so at boot the socket may not be there yet. That is not a
-    # bug of ours and must not reach the journal as a traceback.
+    # A manual send connects once and gives up: a broker that is not listening is reported with
+    # the failure code, not as a traceback. The daemon waits instead, see
+    # test_run_waits_for_the_broker_before_the_first_poll.
     conf = tmp_path / "w.conf"
     _write_valid_config(conf)
-    monkeypatch.setattr(service, "signal", _FakeSignals())
     client = FakeClient()
 
-    def refuse_connection() -> None:
+    def refuse_connection(retry_first_connection: bool = False) -> None:
         raise ConnectionRefusedError("mosquitto is not listening yet")
 
     monkeypatch.setattr(client, "start", refuse_connection)
-    assert entry_point(str(conf), client=client) == service.EXIT_FAILURE
+    assert service.main_send_once(str(conf), client=client) == service.EXIT_FAILURE
 
 
 def test_on_reading_survives_a_payload_that_is_not_utf8() -> None:
@@ -1038,3 +1028,95 @@ def test_an_unchanged_state_file_is_not_rewritten(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(service, "save_state", writes.append)
     service_instance._prune_sent_moments()
     assert not writes
+
+
+def test_run_waits_for_the_broker_before_the_first_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    # After= only orders the start, so at boot the socket may not be there yet. paho retries the
+    # connection in its thread while run() holds the poll loop back: nothing is published into
+    # paho's queue until the broker answers, and the first pass follows the CONNACK.
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    monkeypatch.setattr(client, "start", lambda retry_first_connection=False: None)  # no CONNACK yet
+    client.connected = False
+    polled = threading.Event()
+
+    def poll_once_then_stop() -> None:
+        polled.set()
+        service_instance.stop_service()
+
+    monkeypatch.setattr(service_instance, "_poll_once", poll_once_then_stop)
+    thread = threading.Thread(target=service_instance.run, daemon=True)
+    thread.start()
+    assert not polled.wait(0.1)  # nothing polled without a broker
+    client.connack()  # the broker comes up
+    thread.join(timeout=2)
+    assert polled.is_set()
+    assert not thread.is_alive()
+
+
+def test_run_lets_paho_retry_the_first_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    started_with: dict = {}
+    monkeypatch.setattr(client, "start", lambda **kwargs: started_with.update(kwargs))
+    service_instance._stop_event.set()
+    service_instance.run()
+    assert started_with == {"retry_first_connection": True}
+
+
+@pytest.mark.parametrize("rc", service.MQTT_AUTH_ERRORS)
+def test_a_rejected_login_stops_the_daemon_with_the_no_restart_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rc: int
+) -> None:
+    # A login the broker rejects is a configuration problem paho would retry forever. The service
+    # stops itself and main_daemon exits with 2, which the unit's RestartPreventExitStatus matches.
+    conf = tmp_path / "w.conf"
+    _write_valid_config(conf)
+    monkeypatch.setattr(service, "signal", _FakeSignals())
+    client = FakeClient()
+    client.connected = False
+
+    monkeypatch.setattr(client, "start", lambda retry_first_connection=False: client.connack(rc))
+    assert service.main_daemon(str(conf), client=client) == service.EXIT_INVALIDARGUMENT
+    assert not [topic for topic, *_ in client.published if topic.startswith("/devices/")]
+    assert client.stopped
+
+
+def test_a_rejected_login_after_a_reconnect_stops_the_daemon_too() -> None:
+    service_instance, _ = _service(_config(Device("K1", [Channel("d/c", 0)])))
+    service_instance._on_connect(None, None, None, 0)
+    service_instance._on_connect(None, None, None, 5)
+    assert service_instance.login_rejected is True
+    assert service_instance._stop_event.is_set()
+
+
+def test_stop_without_the_broker_reports_the_topics_it_could_not_remove(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The broker went away before the stop: the wipe cannot be delivered, so the stop says so in
+    # the journal instead of waiting out the confirmation timeout, and still ends cleanly.
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=False)
+    service_instance._stop_event.set()
+    client.connected = False
+    with caplog.at_level("ERROR"):
+        service_instance.run()
+    assert "retained topics cannot be removed" in caplog.text
+    assert not [topic for topic, payload, *_ in client.published if payload == ""]
+    assert client.stopped
+
+
+@pytest.mark.parametrize("entry_point", [service.main_daemon, service.main_send_once], ids=["daemon", "send"])
+def test_no_devices_is_nothing_to_do_not_an_error(
+    entry_point: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fresh-install state. The daemon exits with 7 (a SuccessExitStatus) without publishing a
+    # config error, taking off the broker whatever a previous run left; the manual send just says so.
+    monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
+    monkeypatch.setattr(service, "signal", _FakeSignals())
+    conf = tmp_path / "wb.conf"
+    conf.write_text('{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8")
+    client = FakeClient()
+    assert entry_point(str(conf), client=client) == service.EXIT_NOTRUNNING
+    assert client.last(f"{INTEGRATION_BASE}/controls/state") is None
+    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") is None
+    if entry_point is service.main_daemon:
+        assert (f"{INTEGRATION_BASE}/meta", "", True, 1) in client.published  # the leftovers are wiped
+        assert client.stopped
