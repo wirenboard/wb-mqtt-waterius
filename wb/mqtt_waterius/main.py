@@ -12,6 +12,7 @@ from typing import Any, Optional
 from wb.mqtt_waterius.service import (
     CLIENT_ID,
     EXIT_FAILURE,
+    EXIT_INVALIDARGUMENT,
     main_cleanup,
     main_daemon,
     main_send_once,
@@ -77,7 +78,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Without a command print the help. Starting the daemon here would take the running
     # service's MQTT client id and knock it off the broker.
     parser.print_help()
-    return EXIT_FAILURE
+    return EXIT_INVALIDARGUMENT
 
 
 if __name__ == "__main__":

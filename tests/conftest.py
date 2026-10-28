@@ -2,6 +2,8 @@
 Fakes shared by the tests.
 """
 
+import threading
+import time
 from collections.abc import Callable
 from typing import Any, Optional, Union
 
@@ -44,7 +46,7 @@ class Message:  # pylint: disable=too-few-public-methods
         self.topic = topic
 
 
-class FakeClient:
+class FakeClient:  # pylint: disable=too-many-instance-attributes  # a test double records everything
     """
     In-memory MQTT client stand-in shared by the tests.
 
@@ -61,6 +63,7 @@ class FakeClient:
         self.will: Optional[tuple] = None
         self.will_at_connect: Optional[tuple] = None
         self.published_at_stop: Optional[int] = None
+        self.connected = True  # flipped by the tests that model a broker that is down
 
     @property
     def stopped(self) -> bool:
@@ -88,13 +91,33 @@ class FakeClient:
     def will_set(self, topic: str, payload: str, retain: bool = False) -> None:
         self.will = (topic, payload, retain)
 
-    def start(self) -> None:
+    def start(self, retry_first_connection: bool = False) -> None:  # pylint: disable=unused-argument
         # Real paho sends only the will registered before the connection, so remember what was
-        # armed by then. Then simulate the broker's CONNACK, otherwise a caller waiting on the
-        # connection event would block. Real paho fires on_connect on the network thread.
+        # armed by then. Then simulate the broker's CONNACK (paho fires on_connect on the network
+        # thread), unless the test models a broker that is down: then paho keeps retrying and the
+        # service waits on its stop event.
         self.will_at_connect = self.will
+        if self.connected:
+            self.connack()
+
+    def connack(self, rc: int = 0) -> None:
+        """
+        Deliver the broker's CONNACK to the registered callback, the way paho's network thread does.
+        """
+        self.connected = rc == 0
         if self.on_connect is not None:
-            self.on_connect(self, None, {}, 0)
+            self.on_connect(self, None, {}, rc)
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def wait_for_connection(self, stop_requested: Optional[threading.Event] = None) -> bool:
+        """
+        Like wb-common's: block until connected or the stop event is set.
+        """
+        while not self.connected and not (stop_requested is not None and stop_requested.is_set()):
+            time.sleep(0.01)
+        return self.connected
 
     def stop(self) -> None:
         # Real paho cuts off whatever is still on its way out, so remember what got through.

@@ -52,7 +52,7 @@ def test_argv_dispatch(
 
 def test_no_command_prints_help(dispatched: dict, capsys: pytest.CaptureFixture) -> None:
     # Starting the daemon without a command would take the running service's client id, so main()
-    # prints help and fails instead of picking a default.
-    assert main.main([]) == 1
+    # prints help and fails with the bad-arguments code instead of picking a default.
+    assert main.main([]) == 2
     assert "usage: wb-mqtt-waterius" in capsys.readouterr().out
     assert not dispatched

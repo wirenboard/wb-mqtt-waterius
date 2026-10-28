@@ -59,12 +59,17 @@ SEND_OK = "ok"
 SEND_TRANSIENT = "transient"
 SEND_PERMANENT = "permanent"
 
-# Exit codes. Code 6 (config error) is excluded from systemd auto-restart by the unit's
-# RestartPreventExitStatus, so a broken config stops cleanly instead of crash-looping.
-# Saving a fixed config in the web UI makes confed restart the service.
+# Exit codes. 2 (bad arguments or a login the broker rejects) and 6 (config error) are excluded
+# from systemd auto-restart by the unit's RestartPreventExitStatus, so a broken config stops
+# cleanly instead of crash-looping; saving a fixed config in the web UI makes confed restart the
+# service. 7 (no devices configured) is a SuccessExitStatus: nothing to do is not a failure.
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
+EXIT_INVALIDARGUMENT = 2
 EXIT_CONFIG_ERROR = 6
+EXIT_NOTRUNNING = 7
+# CONNACK codes for a rejected login: bad user name or password, not authorized
+MQTT_AUTH_ERRORS = (4, 5)
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +139,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._state_lock = threading.Lock()  # serializes state mutation and save across threads
 
         self._stop_event = threading.Event()
-        self._connected_event = threading.Event()  # set once the first CONNACK arrives
         self._resetup_event = threading.Event()  # set on every (re)connect, re-publish devices
         self._toggle_event = threading.Event()  # set by the switch, the loop republishes the status
         self._wake_event = threading.Event()  # interrupts the poll sleep (reconnect or stop)
@@ -147,6 +151,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._state: State = load_state()
         stamps = self._get_sent_stamps()
         self._enabled = self._state["enabled"]
+        self._login_rejected = False
 
         # client is injectable for tests and for the entry points that need a distinct id
         # (a manual send must not reuse the daemon's id, see main_send_once). Default is the daemon.
@@ -191,20 +196,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
     def _apply_resting_state(self) -> None:
         """
-        Set the steady-state status.
-
-        Invalid config raises the error flag on the State control, the disabled and active
-        resting states clear it.
+        Set the steady-state status, disabled or active; both clear the error flag.
         """
-        if not self._config.devices:
-            self._wb_devices.set_state(STATE_CONFIG_INVALID)
-            self._wb_devices.set_integration_error(True)
-        elif not self._enabled:
-            self._wb_devices.set_integration_error(False)
-            self._wb_devices.set_state(STATE_DISABLED)
-        else:
-            self._wb_devices.set_integration_error(False)
-            self._wb_devices.set_state(STATE_ACTIVE)
+        self._wb_devices.set_integration_error(False)
+        self._wb_devices.set_state(STATE_ACTIVE if self._enabled else STATE_DISABLED)
 
     def _save_state_values(self, **values: Any) -> None:
         """
@@ -350,9 +345,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Returns:
             True when every device had a full set of readings
         """
-        if not self._config.devices:
-            logger.info("No devices configured, nothing to send")
-            return False
         self._await_readings()
         complete = True
 
@@ -469,12 +461,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
             True when every device of the batch was accepted
         """
         with self._send_lock:
-            if not self._config.devices:
-                logger.info("No devices configured, nothing to send")
-                self._wb_devices.set_state(STATE_CONFIG_INVALID)
-                self._wb_devices.set_integration_error(True)
-                return False
-
             self._await_readings()
             pending, held, aborted = self._send_devices_data(indices)
             # Only the devices of this batch change verdict, the ones left out keep theirs.
@@ -521,7 +507,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         a device held after a 404 waits for the next slot. The manual send obeys none of this,
         see send_now.
         """
-        if not self._enabled or not self._config.devices:
+        if not self._enabled:
             return
         now = self._datetime_now()
         send_time = get_due_send_time(now, self._send_hour, self._send_minute, self._config.days_of_week)
@@ -545,6 +531,13 @@ class Service:  # pylint: disable=too-many-instance-attributes
         if unsent_devices:
             self._send_batch(unsent_devices)
 
+    @property
+    def login_rejected(self) -> bool:
+        """
+        True once the broker has rejected the login and the loop has stopped because of it.
+        """
+        return self._login_rejected
+
     def _on_connect(self, _client: MQTTClient, _userdata: Any, _flags: Any, rc: int) -> None:
         """
         Runs on the initial connect and on every automatic reconnect.
@@ -554,8 +547,12 @@ class Service:  # pylint: disable=too-many-instance-attributes
         """
         if rc != 0:
             logger.warning("MQTT connect failed, rc=%s", rc)
+            if rc in MQTT_AUTH_ERRORS:
+                # a configuration problem paho would retry forever: stop and exit with 2, at
+                # startup and after a reconnect alike
+                self._login_rejected = True
+                self.stop_service()
             return
-        self._connected_event.set()
         self._resetup_event.set()
         self._wake_event.set()
 
@@ -578,15 +575,12 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._subscribe_readings()
 
     def _log_startup(self) -> None:
-        if not self._config.devices:
-            logger.info("Started, no devices configured yet")
-        else:
-            logger.info(
-                "Started, send at %02d:%02d, automatic=%s",
-                self._send_hour,
-                self._send_minute,
-                self._enabled,
-            )
+        logger.info(
+            "Started, send at %02d:%02d, automatic=%s",
+            self._send_hour,
+            self._send_minute,
+            self._enabled,
+        )
 
     def _poll_once(self) -> None:
         """
@@ -619,8 +613,11 @@ class Service:  # pylint: disable=too-many-instance-attributes
         # Covers an ungraceful death (SIGKILL, OOM), the broker raises the error flag for us.
         # Must come before the connection, paho only sends a will registered by then.
         self._wb_devices.set_last_will()
-        self._client.start()
-        _wait_connected(self._connected_event, CONNECT_TIMEOUT)
+        # An unavailable broker is retried by paho's network thread; the poll loop starts on a
+        # live connection, so nothing piles up in paho's queue meanwhile. A signal or a rejected
+        # login sets the stop event and ends the wait early.
+        self._client.start(retry_first_connection=True)
+        self._client.wait_for_connection(self._stop_event)
         self._log_startup()
 
         while not self._stop_event.is_set():
@@ -638,8 +635,9 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Nothing else can, the package scripts run when the service is already down. Only on
         the clean path, a crash has to leave the devices and their error flag up.
         """
-        if not self._connected_event.is_set():
-            return  # never connected, so nothing of ours reached the broker
+        if not self._client.is_connected():
+            logger.error("MQTT broker is not connected, retained topics cannot be removed")
+            return
         try:
             self._unsubscribe_readings()
             removed = self._wb_devices.remove()
@@ -682,12 +680,13 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
 def _report_config_error(client: MQTTClient) -> None:
     """
-    Reflect a broken config in the web UI.
+    Reflect a broken or empty config in the web UI.
 
-    The daemon exits with EXIT_CONFIG_ERROR and stays down, but its devices are retained in
-    the broker and would keep showing "Active", so the integration would look alive while it
-    is dead. Wipes the key devices, which the broken config no longer describes, and marks
-    the integration device "Config Not Valid" in red. Best-effort, never blocks the exit.
+    The daemon exits with EXIT_CONFIG_ERROR or EXIT_NOTRUNNING and stays down, but its devices
+    are retained in the broker and would keep showing "Active", so the integration would look
+    alive while it is dead. Wipes the key devices, which the config no longer describes, and
+    marks the integration device "Config Not Valid" in red; on a fresh install that is the hint
+    to add a key. Best-effort, never blocks the exit.
     """
     try:
         connect_and_wait(client)
@@ -701,20 +700,19 @@ def _report_config_error(client: MQTTClient) -> None:
         logger.warning("Could not publish config-error status: %s", exc)
 
 
-def _prepare_service(config_path: Optional[str], client: Optional[MQTTClient]) -> Optional[Service]:
+def _load_config_or_report(config_path: Optional[str], client: Optional[MQTTClient]) -> Optional[Config]:
     """
-    Shared entry-point prefix, loads the config and builds the service.
+    Shared entry-point prefix, loads the config.
 
     On a config error reflects it in the UI and returns None, so the caller exits with
     EXIT_CONFIG_ERROR.
     """
     try:
-        config = load_config(config_path)
+        return load_config(config_path)
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         _report_config_error(client or MQTTClient(CLIENT_ID))
         return None
-    return Service(config, client=client)
 
 
 def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] = None) -> int:
@@ -730,9 +728,14 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGHUP, _handle_stop)
 
-    service = _prepare_service(config_path, client)
-    if service is None:
+    config = _load_config_or_report(config_path, client)
+    if config is None:
         return EXIT_CONFIG_ERROR
+    if not config.devices:
+        logger.info("No devices configured, nothing to do")
+        _report_config_error(client or MQTTClient(CLIENT_ID))
+        return EXIT_NOTRUNNING
+    service = Service(config, client=client)
 
     try:
         service.run()
@@ -740,7 +743,7 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
         logger.error("MQTT transport error: %s", exc)
         return EXIT_FAILURE
 
-    return EXIT_SUCCESS
+    return EXIT_INVALIDARGUMENT if service.login_rejected else EXIT_SUCCESS
 
 
 def main_send_once(
@@ -748,9 +751,14 @@ def main_send_once(
 ) -> int:
     # A distinct client id so a manual `send` while the daemon runs does not knock the
     # daemon off the broker (same id = the broker drops the incumbent session).
-    service = _prepare_service(config_path, client or MQTTClient(f"{CLIENT_ID}-send"))
-    if service is None:
+    client = client or MQTTClient(f"{CLIENT_ID}-send")
+    config = _load_config_or_report(config_path, client)
+    if config is None:
         return EXIT_CONFIG_ERROR
+    if not config.devices:
+        logger.info("No devices configured, nothing to send")
+        return EXIT_NOTRUNNING
+    service = Service(config, client=client)
     try:
         sent = service.run_once(dry_run=dry_run)
     except OSError as exc:

@@ -3,27 +3,19 @@ Load and validate /etc/wb-mqtt-waterius.conf.
 """
 
 import json
-import re
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
+import jsonschema
+
 from wb.mqtt_waterius.waterius_api import short_key
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_PATH = "/etc/wb-mqtt-waterius.conf"
-TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
-
-# The Waterius protocol holds ch0..ch3, and the configurator schema caps the table at four
-# rows. This check is for a hand-edited config file.
-MAX_CHANNELS = 4
-
-# Waterius rejects a longer serial with HTTP 400 and drops the whole request, so one long
-# serial loses the readings of every meter on the key.
-MAX_SERIAL_LENGTH = 15
-
-# Waterius data-type codes. A code outside the range does not exist and the cloud renders an
-# unknown one as water, so a typo would silently land in the wrong meter.
-DATA_TYPES = range(10)
+SCHEMA_PATH = "/usr/share/wb-mqtt-confed/schemas/wb-mqtt-waterius.schema.json"
 
 # Config weekday names -> datetime.weekday() index (Monday=0 .. Sunday=6).
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -116,42 +108,12 @@ class Config:
 
 
 def _parse_channel(raw_channel: dict) -> Channel:
-    source = raw_channel.get("mqttTopicName")
-    if not source or "/" not in source:
-        raise ConfigError(f"channel mqttTopicName must be 'device/control', got {source!r}")
-    if "dataType" not in raw_channel:
-        raise ConfigError(f"channel {source!r} has no dataType")
-    try:
-        data_type = int(raw_channel["dataType"])
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            f"channel {source!r} has a non-numeric dataType {raw_channel['dataType']!r}"
-        ) from exc
-    if data_type not in DATA_TYPES:
-        raise ConfigError(
-            f"channel {source!r} has unknown dataType {data_type}, "
-            f"expected {min(DATA_TYPES)}..{max(DATA_TYPES)}"
-        )
-    serial = raw_channel.get("serial")
-    serial_length = len(str(serial)) if serial else 0
-    if serial_length > MAX_SERIAL_LENGTH:
-        raise ConfigError(
-            f"channel {source!r} has a {serial_length}-character serial, max is {MAX_SERIAL_LENGTH}"
-        )
-    return Channel(source, data_type, serial)
+    return Channel(raw_channel["mqttTopicName"], raw_channel["dataType"], raw_channel.get("serial"))
 
 
 def _parse_device(raw_device: dict) -> Device:
-    key = raw_device.get("key")
-    if not key:
-        raise ConfigError("device has no key")
-    channels = [_parse_channel(raw_channel) for raw_channel in raw_device.get("channels", [])]
-    if not channels:
-        raise ConfigError(f"device {short_key(key)} has no channels")
-    if len(channels) > MAX_CHANNELS:
-        raise ConfigError(f"device {short_key(key)} has {len(channels)} channels, max is {MAX_CHANNELS}")
-    name = raw_device.get("name") or ""
-    return Device(key, channels, str(name).strip())
+    channels = [_parse_channel(raw_channel) for raw_channel in raw_device["channels"]]
+    return Device(raw_device["key"], channels, raw_device.get("name", "").strip())
 
 
 def _find_duplicate_key(devices: list[Device]) -> Optional[str]:
@@ -175,47 +137,12 @@ def _find_duplicate_key(devices: list[Device]) -> Optional[str]:
     return None
 
 
-def _parse_send_time(data: dict) -> str:
-    """
-    Pull the daily send time out of the raw config.
-
-    Examples:
-        >>> _parse_send_time({"sendTime": "03:00"})
-        '03:00'
-    """
-    send_time = data.get("sendTime")
-    if not isinstance(send_time, str):
-        raise ConfigError("sendTime is required")
-    if not TIME_RE.match(send_time):
-        raise ConfigError(f"sendTime must be HH:MM, got {send_time!r}")
-    return send_time
-
-
-def _parse_days_of_week(data: dict) -> set[int]:
-    """
-    Convert the configured weekday names to datetime.weekday() indices.
-
-    Days are required and every name must be known. Dropping an unrecognized name would turn
-    a typo in a hand-edited file into a day that silently never fires.
-
-    Examples:
-        >>> sorted(_parse_days_of_week({"daysOfWeek": ["monday", "sunday"]}))
-        [0, 6]
-    """
-    raw_days = data.get("daysOfWeek")
-    if not isinstance(raw_days, list) or not raw_days:
-        raise ConfigError("at least one send day must be selected")
-    days: set[int] = set()
-    for day in raw_days:
-        if day not in WEEKDAYS:
-            raise ConfigError(f"unknown send day {day!r}")
-        days.add(WEEKDAYS.index(day))
-    return days
-
-
 def parse_config(data: dict) -> Config:
     """
     Build a Config from a plain dict, the already-parsed JSON of the config file.
+
+    The shape of the data — types, required fields, ranges — is the schema's business, see
+    load_config. Here only what a schema cannot say is checked: a key used by two devices.
 
     Examples:
         >>> config = parse_config(
@@ -236,19 +163,34 @@ def parse_config(data: dict) -> Config:
         >>> config.devices[0].name, config.devices[0].channels[0].mqtt_topic
         ('Boiler', '/devices/wb-map12/controls/ch1')
     """
-    send_time = _parse_send_time(data)
-    raw_devices = data.get("devices")
-    if not isinstance(raw_devices, list):
-        raise ConfigError("devices is required, use an empty list when nothing is configured")
-    # An empty list is the fresh-install state, the daemon idles instead of crash-looping.
-    devices = [_parse_device(raw_device) for raw_device in raw_devices]
+    # An empty list is the fresh-install state, the daemon flags it in the UI and exits with 7.
+    devices = [_parse_device(raw_device) for raw_device in data["devices"]]
     duplicate = _find_duplicate_key(devices)
     if duplicate:
         raise ConfigError(f"duplicate device key {short_key(duplicate)}")
-    return Config(send_time=send_time, devices=devices, days_of_week=_parse_days_of_week(data))
+    days_of_week = {WEEKDAYS.index(day) for day in data["daysOfWeek"]}
+    return Config(send_time=data["sendTime"], devices=devices, days_of_week=days_of_week)
 
 
-def load_config(path: Optional[str] = None) -> Config:
+def _check_against_schema(data: object, path: str, schema_path: str) -> None:
+    """
+    Reject what the confed schema forbids: types, required fields, ranges and lengths, which
+    the parser takes on trust, as wb-mqtt-serial does. Without the schema (a dev box) nothing
+    checks the shape of the file.
+    """
+    try:
+        with open(schema_path, encoding="utf-8") as handle:
+            jsonschema.validate(data, json.load(handle))
+    except FileNotFoundError:
+        logger.warning("Schema %s not found, the config is not checked against it", schema_path)
+    except jsonschema.ValidationError as exc:
+        where = ".".join(str(step) for step in exc.absolute_path) or "config"
+        raise ConfigError(f"{path}: {where}: {exc.message}") from exc
+    except (OSError, ValueError, jsonschema.SchemaError) as exc:
+        raise ConfigError(f"cannot use schema {schema_path}: {exc}") from exc
+
+
+def load_config(path: Optional[str] = None, schema_path: str = SCHEMA_PATH) -> Config:
     """
     Read and validate the config file, /etc/wb-mqtt-waterius.conf unless another path is given.
 
@@ -259,8 +201,9 @@ def load_config(path: Optional[str] = None) -> Config:
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
+    _check_against_schema(data, path, schema_path)
     return parse_config(data)
