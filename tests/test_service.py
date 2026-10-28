@@ -141,22 +141,16 @@ def test_get_channel_value_coercion() -> None:
 
 
 @pytest.mark.parametrize(
-    "devices, enabled, expected_state, expected_flag",
-    [
-        ([], True, mqtt_device.STATE_CONFIG_INVALID, "w"),
-        ([Device("K1", [Channel("d/c", 0)])], False, mqtt_device.STATE_DISABLED, ""),
-        ([Device("K1", [Channel("d/c", 0)])], True, mqtt_device.STATE_ACTIVE, ""),
-    ],
-    ids=["no_devices", "disabled", "active"],
+    "enabled, expected_state",
+    [(False, mqtt_device.STATE_DISABLED), (True, mqtt_device.STATE_ACTIVE)],
+    ids=["disabled", "active"],
 )
-def test_apply_resting_state(
-    devices: list[Device], enabled: bool, expected_state: int, expected_flag: str
-) -> None:
-    # Only an invalid config raises the error flag, the disabled and active resting states clear it.
-    service_instance, client = _service(_config(*devices), enabled=enabled)
+def test_apply_resting_state(enabled: bool, expected_state: int) -> None:
+    # Both resting states clear the error flag.
+    service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), enabled=enabled)
     service_instance._apply_resting_state()
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(expected_state)
-    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == expected_flag
+    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == ""
 
 
 def test_on_toggle_persists_and_wakes_the_loop() -> None:
@@ -343,13 +337,6 @@ def test_send_now_missing_channel_never_posts(monkeypatch: pytest.MonkeyPatch) -
     assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_HAS_ERRORS)
 
 
-def test_send_now_no_devices() -> None:
-    service_instance, client = _service(_config())
-    assert service_instance.send_now() is False
-    assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_CONFIG_INVALID)
-    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == "w"
-
-
 def test_dry_run_builds_no_client_and_has_no_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     # A dry run posts nothing, so it must not open a cloud client at all, and it leaves the
     # status devices and the persisted state exactly as they were.
@@ -377,14 +364,6 @@ def test_dry_run_reports_missing_readings() -> None:
     service_instance, client = _service(_config(Device("K1", [Channel("d/c", 0)])), values={})
     assert service_instance.dry_run_payloads() is False
     assert client.last(f"{KEY_DEVICE1_BASE}/controls/last_error") is None  # status untouched by a dry run
-
-
-def test_dry_run_with_no_devices_reports_nothing_to_send() -> None:
-    # The state of every fresh install. There is nothing to build, and the answer is what the
-    # CLI turns into its exit code.
-    service_instance, client = _service(_config())
-    assert service_instance.dry_run_payloads() is False
-    assert not client.published  # a dry run leaves the status devices alone
 
 
 @pytest.mark.parametrize(
@@ -1107,16 +1086,18 @@ def test_stop_without_the_broker_reports_the_topics_it_could_not_remove(
 def test_no_devices_is_nothing_to_do_not_an_error(
     entry_point: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The fresh-install state. The daemon exits with 7 (a SuccessExitStatus) without publishing a
-    # config error, taking off the broker whatever a previous run left; the manual send just says so.
+    # The fresh-install state. The daemon exits with 7 (a SuccessExitStatus) but leaves the
+    # integration device red, "Config Not Valid", the hint to add a key; the manual send just says so.
     monkeypatch.setattr("wb.mqtt_waterius.mqtt_device._scan_retained", lambda *_args: [])
     monkeypatch.setattr(service, "signal", _FakeSignals())
     conf = tmp_path / "wb.conf"
     conf.write_text('{"sendTime": "03:00", "daysOfWeek": ["monday"], "devices": []}', encoding="utf-8")
     client = FakeClient()
     assert entry_point(str(conf), client=client) == service.EXIT_NOTRUNNING
-    assert client.last(f"{INTEGRATION_BASE}/controls/state") is None
-    assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") is None
     if entry_point is service.main_daemon:
+        assert client.last(f"{INTEGRATION_BASE}/controls/state") == str(mqtt_device.STATE_CONFIG_INVALID)
+        assert client.last(f"{INTEGRATION_BASE}/controls/state/meta/error") == "w"
         assert (f"{INTEGRATION_BASE}/meta", "", True, 1) in client.published  # the leftovers are wiped
         assert client.stopped
+    else:
+        assert not client.published  # a manual send touches nothing in the UI

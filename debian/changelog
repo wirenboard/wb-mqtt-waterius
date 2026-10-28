@@ -1,14 +1,11 @@
 wb-mqtt-waterius (1.1.0) stable; urgency=medium
 
-  * Exit with 7 when no devices are configured, without publishing a config error
-  * Exit with 6 on every config read or parse error, with 2 on bad arguments
-  * Wait for an unavailable MQTT broker instead of exiting; exit with 2 when the
-    broker rejects the login
-  * Report when the retained topics cannot be removed at stop because the broker
-    is not connected; RestartSec=1, no restart on 2 and 6, 7 is a success
-  * Require python3-wb-common >= 2.4.0 (MQTT client retry/wait API)
+  * Service guideline: exit codes 0/1/2/6/7, no restart on 2 and 6, 7 is a success
+  * Exit with 6 on any config error, the config is checked against the schema
+  * Exit with 7 when no devices are configured, the UI shows "Config Not Valid"
+  * Wait for an unavailable MQTT broker instead of exiting
 
- -- Ekaterina Volkova <ekaterina.volkova@wirenboard.com>  Thu, 17 Sep 2026 16:11:39 +0000
+ -- Ekaterina Volkova <ekaterina.volkova@wirenboard.com>  Wed, 28 Oct 2026 12:22:53 +0000
 
 wb-mqtt-waterius (1.0.0) stable; urgency=medium
 

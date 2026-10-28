@@ -196,20 +196,10 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
     def _apply_resting_state(self) -> None:
         """
-        Set the steady-state status.
-
-        Invalid config raises the error flag on the State control, the disabled and active
-        resting states clear it.
+        Set the steady-state status, disabled or active; both clear the error flag.
         """
-        if not self._config.devices:
-            self._wb_devices.set_state(STATE_CONFIG_INVALID)
-            self._wb_devices.set_integration_error(True)
-        elif not self._enabled:
-            self._wb_devices.set_integration_error(False)
-            self._wb_devices.set_state(STATE_DISABLED)
-        else:
-            self._wb_devices.set_integration_error(False)
-            self._wb_devices.set_state(STATE_ACTIVE)
+        self._wb_devices.set_integration_error(False)
+        self._wb_devices.set_state(STATE_ACTIVE if self._enabled else STATE_DISABLED)
 
     def _save_state_values(self, **values: Any) -> None:
         """
@@ -355,9 +345,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Returns:
             True when every device had a full set of readings
         """
-        if not self._config.devices:
-            logger.info("No devices configured, nothing to send")
-            return False
         self._await_readings()
         complete = True
 
@@ -474,12 +461,6 @@ class Service:  # pylint: disable=too-many-instance-attributes
             True when every device of the batch was accepted
         """
         with self._send_lock:
-            if not self._config.devices:
-                logger.info("No devices configured, nothing to send")
-                self._wb_devices.set_state(STATE_CONFIG_INVALID)
-                self._wb_devices.set_integration_error(True)
-                return False
-
             self._await_readings()
             pending, held, aborted = self._send_devices_data(indices)
             # Only the devices of this batch change verdict, the ones left out keep theirs.
@@ -526,7 +507,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         a device held after a 404 waits for the next slot. The manual send obeys none of this,
         see send_now.
         """
-        if not self._enabled or not self._config.devices:
+        if not self._enabled:
             return
         now = self._datetime_now()
         send_time = get_due_send_time(now, self._send_hour, self._send_minute, self._config.days_of_week)
@@ -594,15 +575,12 @@ class Service:  # pylint: disable=too-many-instance-attributes
         self._subscribe_readings()
 
     def _log_startup(self) -> None:
-        if not self._config.devices:
-            logger.info("Started, no devices configured yet")
-        else:
-            logger.info(
-                "Started, send at %02d:%02d, automatic=%s",
-                self._send_hour,
-                self._send_minute,
-                self._enabled,
-            )
+        logger.info(
+            "Started, send at %02d:%02d, automatic=%s",
+            self._send_hour,
+            self._send_minute,
+            self._enabled,
+        )
 
     def _poll_once(self) -> None:
         """
@@ -702,12 +680,13 @@ class Service:  # pylint: disable=too-many-instance-attributes
 
 def _report_config_error(client: MQTTClient) -> None:
     """
-    Reflect a broken config in the web UI.
+    Reflect a broken or empty config in the web UI.
 
-    The daemon exits with EXIT_CONFIG_ERROR and stays down, but its devices are retained in
-    the broker and would keep showing "Active", so the integration would look alive while it
-    is dead. Wipes the key devices, which the broken config no longer describes, and marks
-    the integration device "Config Not Valid" in red. Best-effort, never blocks the exit.
+    The daemon exits with EXIT_CONFIG_ERROR or EXIT_NOTRUNNING and stays down, but its devices
+    are retained in the broker and would keep showing "Active", so the integration would look
+    alive while it is dead. Wipes the key devices, which the config no longer describes, and
+    marks the integration device "Config Not Valid" in red; on a fresh install that is the hint
+    to add a key. Best-effort, never blocks the exit.
     """
     try:
         connect_and_wait(client)
@@ -736,22 +715,6 @@ def _load_config_or_report(config_path: Optional[str], client: Optional[MQTTClie
         return None
 
 
-def _remove_stale_devices(client: MQTTClient) -> None:
-    """
-    Best-effort: take off the broker whatever a previous run left, before exiting with nothing to do.
-
-    A config-error report or the devices of a key deleted since would otherwise stay in the UI
-    with no daemon behind them.
-    """
-    try:
-        connect_and_wait(client)
-        clear_all(client)
-        wait_for_broker(client)
-        client.stop()
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Could not remove the devices: %s", exc)
-
-
 def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] = None) -> int:
     service: Optional[Service] = None
 
@@ -770,7 +733,7 @@ def main_daemon(config_path: Optional[str] = None, client: Optional[MQTTClient] 
         return EXIT_CONFIG_ERROR
     if not config.devices:
         logger.info("No devices configured, nothing to do")
-        _remove_stale_devices(client or MQTTClient(CLIENT_ID))
+        _report_config_error(client or MQTTClient(CLIENT_ID))
         return EXIT_NOTRUNNING
     service = Service(config, client=client)
 
