@@ -185,6 +185,10 @@ def _check_against_schema(data: object, path: str, schema_path: str) -> None:
         logger.warning("Schema %s not found, the config is not checked against it", schema_path)
     except jsonschema.ValidationError as exc:
         where = ".".join(str(step) for step in exc.absolute_path) or "config"
+        # The message quotes the value, and the key is a cloud credential, so for the key
+        # the rule that failed is reported instead.
+        if exc.absolute_path and exc.absolute_path[-1] == "key":
+            raise ConfigError(f"{path}: {where}: {exc.validator} {exc.validator_value!r}") from exc
         raise ConfigError(f"{path}: {where}: {exc.message}") from exc
     except (OSError, ValueError, jsonschema.SchemaError) as exc:
         raise ConfigError(f"cannot use schema {schema_path}: {exc}") from exc

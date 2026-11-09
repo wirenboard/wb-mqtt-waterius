@@ -131,6 +131,17 @@ def test_load_config_rejects_what_the_schema_forbids(tmp_path: Path, bad: dict) 
         config.load_config(str(path), schema_path=str(SCHEMA_PATH))
 
 
+@pytest.mark.parametrize("raw_key", [["SECRET-KEY"], "", 5], ids=["list", "empty", "int"])
+def test_schema_error_on_the_key_does_not_quote_it(tmp_path: Path, raw_key: object) -> None:
+    # The key is a cloud credential and the message goes to the journal: the error names the
+    # field and the rule, never the value, unlike the errors on the other fields.
+    path = tmp_path / "wb-mqtt-waterius.conf"
+    path.write_text(json.dumps(_with(_valid_config(), devices=[_device(key=raw_key)])), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="devices.0.key: ") as excinfo:
+        config.load_config(str(path), schema_path=str(SCHEMA_PATH))
+    assert "SECRET" not in str(excinfo.value)
+
+
 def test_duplicate_key_raises() -> None:
     # The one thing a schema cannot say, so the parser says it.
     data = _with(_valid_config(), devices=[_device(), _device(channels=[_channel(mqttTopicName="d/b")])])
