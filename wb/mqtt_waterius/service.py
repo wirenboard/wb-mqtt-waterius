@@ -242,7 +242,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         has to remember what the broker was given last.
         """
         now = self._datetime_now()
-        if self._enabled and self._config.devices:
+        if self._enabled:
             next_dt = next_run(self._send_hour, self._send_minute, self._config.days_of_week, now)
             next_text = format_datetime(next_dt) if next_dt else NO_TIME
         else:
@@ -488,7 +488,7 @@ class Service:  # pylint: disable=too-many-instance-attributes
         Aggregate device errors onto the integration device.
 
         Red plus Has Errors if anything failed its last attempt or is held, otherwise the resting
-        state — Active, Disabled or Config Not Valid.
+        state — Active or Disabled.
         """
         if self._failed_transient or self._failed_hold:
             self._wb_devices.set_integration_error(True)
