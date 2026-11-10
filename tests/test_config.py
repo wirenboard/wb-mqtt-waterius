@@ -131,13 +131,32 @@ def test_load_config_rejects_what_the_schema_forbids(tmp_path: Path, bad: dict) 
         config.load_config(str(path), schema_path=str(SCHEMA_PATH))
 
 
-@pytest.mark.parametrize("raw_key", [["SECRET-KEY"], "", 5], ids=["list", "empty", "int"])
-def test_schema_error_on_the_key_does_not_quote_it(tmp_path: Path, raw_key: object) -> None:
-    # The key is a cloud credential and the message goes to the journal: the error names the
-    # field and the rule, never the value, unlike the errors on the other fields.
+@pytest.mark.parametrize(
+    ("bad", "where"),
+    [
+        pytest.param(
+            _with(_valid_config(), devices=[_device(key=["SECRET-KEY"])]), "devices.0.key", id="key-list"
+        ),
+        pytest.param(_with(_valid_config(), devices=[_device(key="")]), "devices.0.key", id="key-empty"),
+        pytest.param(_with(_valid_config(), devices=["SECRET-KEY"]), "devices.0", id="key-as-device"),
+        pytest.param(
+            _with(_valid_config(), devices=[_device(name="SECRET-KEY" * 4)]),
+            "devices.0.name",
+            id="key-as-name",
+        ),
+        pytest.param(
+            _with(_valid_config(), devices=[_device(channels=[_channel(mqttTopicName="SECRET-KEY")])]),
+            "devices.0.channels.0.mqttTopicName",
+            id="key-as-topic",
+        ),
+    ],
+)
+def test_schema_error_names_the_rule_not_the_value(tmp_path: Path, bad: dict, where: str) -> None:
+    # The key is a cloud credential, the message goes to the journal, and a hand-edited file can
+    # put the key into any field: the error names the field and the rule, never the value.
     path = tmp_path / "wb-mqtt-waterius.conf"
-    path.write_text(json.dumps(_with(_valid_config(), devices=[_device(key=raw_key)])), encoding="utf-8")
-    with pytest.raises(config.ConfigError, match="devices.0.key: ") as excinfo:
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match=f"{where}: ") as excinfo:
         config.load_config(str(path), schema_path=str(SCHEMA_PATH))
     assert "SECRET" not in str(excinfo.value)
 
