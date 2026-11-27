@@ -11,7 +11,7 @@ setup(
     maintainer_email="info@wirenboard.com",
     description="Send Wiren Board meter readings to the Waterius cloud",
     url="https://github.com/wirenboard/wb-mqtt-waterius",
-    license="MIT",
+    license="MIT-WB",
     # Matches every subpackage of wb. "wb" itself stays out, it comes from the base package.
     packages=find_namespace_packages(include=["wb.*"]),
     scripts=["bin/wb-mqtt-waterius"],
